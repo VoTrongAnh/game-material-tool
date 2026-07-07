@@ -1,362 +1,698 @@
 """
-AI Game Asset Studio — Module AI/Model
-Tác giả: Trọng Anh
-Mô tả: Sinh game asset (background, sprite, tilesheet, pixel art) từ Pollinations.ai
+AI Game Asset Studio - AI embeddable module.
+
+Scope:
+- Build prompts for game assets.
+- Call an image provider (currently Pollinations).
+- Post-process generated images into predictable game-ready outputs.
+- Return metadata that a web/backend team can consume.
 """
 
+from __future__ import annotations
+
+import io
 import os
 import re
 import time
-import requests
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, Protocol
 from urllib.parse import quote
-from PIL import Image, ImageFilter
-import io
 
-# ─────────────────────────────────────────────
-# CẤU HÌNH CHUNG
-# ─────────────────────────────────────────────
+import requests
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-BASE_URL = "https://image.pollinations.ai/prompt"
-API_KEY  = os.getenv("POLLINATIONS_API_KEY", "")   # Đặt key vào env hoặc để trống (free tier)
+
+POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt"
+API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
 OUTPUT_DIR = Path("output")
 
-# Kích thước chuẩn cho từng loại asset
-ASSET_SIZES = {
-    "background_hd":   (1920, 1080),
-    "background_4k":   (3840, 2160),
-    "background_sd":   (1280, 720),
-    "background_sq":   (1080, 1080),   # dùng cho Scratch Stage
-    "sprite_small":    (64,   64),
-    "sprite_medium":   (128,  128),
-    "sprite_large":    (256,  256),
-    "tilesheet":       (512,  512),    # 10-frame: mỗi frame ~51x512
-    "icon":            (32,   32),
+
+ASSET_SIZES: dict[str, tuple[int, int]] = {
+    "background_hd": (1920, 1080),
+    "background_4k": (3840, 2160),
+    "background_sd": (1280, 720),
+    "background_sq": (1080, 1080),
+    "sprite_small": (64, 64),
+    "sprite_medium": (128, 128),
+    "sprite_large": (256, 256),
+    "icon": (32, 32),
 }
 
-# ─────────────────────────────────────────────
-# PROMPT OPTIMIZER
-# ─────────────────────────────────────────────
+BACKGROUND_SIZE_KEYS = {"background_hd", "background_4k", "background_sd", "background_sq"}
+SPRITE_SIZE_KEYS = {"sprite_small", "sprite_medium", "sprite_large", "icon"}
+PIXEL_SIZE_KEYS = SPRITE_SIZE_KEYS | {"background_sq"}
+
+
+@dataclass
+class FrameMetadata:
+    index: int
+    x: int
+    y: int
+    w: int
+    h: int
+    file_path: str | None = None
+
+
+@dataclass
+class GeneratedAsset:
+    asset_id: str
+    asset_type: str
+    prompt: str
+    provider: str
+    model: str
+    seed: int
+    width: int
+    height: int
+    format: str
+    file_path: str
+    has_alpha: bool
+    frames: list[FrameMetadata] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def path(self) -> Path:
+        return Path(self.file_path)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def __fspath__(self) -> str:
+        return self.file_path
+
+    def __str__(self) -> str:
+        return self.file_path
+
+
+@dataclass
+class ProviderResult:
+    image: Image.Image
+    provider: str
+    model: str
+    seed: int
+    warnings: list[str] = field(default_factory=list)
+
+
+class AIImageProvider(Protocol):
+    name: str
+    model: str
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        width: int,
+        height: int,
+        seed: int = -1,
+        negative_prompt: str | None = None,
+    ) -> ProviderResult:
+        ...
+
 
 class PromptOptimizer:
-    """
-    Tối ưu prompt để Pollinations trả về asset đúng phong cách và định dạng.
-    """
+    """Build prompts for different game asset types."""
 
     STYLE_TAGS = {
-        "pixel_art":    "pixel art, 8-bit, retro game style, crisp pixels, no anti-aliasing",
-        "cartoon":      "2D cartoon, flat color, thick outlines, bright palette, game asset",
-        "realistic":    "realistic, detailed textures, high quality, game environment",
-        "chibi":        "chibi style, cute, rounded shapes, vibrant colors, game sprite",
+        "pixel_art": "pixel art, 8-bit, retro game style, crisp hard pixels, no anti-aliasing",
+        "cartoon": "2D cartoon, flat colors, thick outlines, bright palette, game asset",
+        "realistic": "realistic, detailed textures, high quality, game environment",
+        "chibi": "chibi style, cute, rounded shapes, vibrant colors, game sprite",
     }
 
     NEGATIVE_BASE = (
-        "blurry, watermark, text, logo, signature, extra limbs, "
-        "bad anatomy, low quality, cropped, deformed"
+        "blurry, watermark, text, logo, signature, extra limbs, bad anatomy, "
+        "low quality, cropped, deformed, noisy"
     )
 
     @staticmethod
-    def build_background_prompt(subject: str, style: str = "pixel_art",
-                                 time_of_day: str = "day") -> str:
+    def build_background_prompt(
+        subject: str,
+        style: str = "pixel_art",
+        time_of_day: str = "day",
+    ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
         return (
-            f"{subject}, {time_of_day} lighting, seamless background, "
-            f"game background, side-scrolling, no characters, {style_tag}, "
-            f"high detail, wide shot"
+            f"{subject}, {time_of_day} lighting, seamless game background, "
+            f"side-scrolling environment, no characters, no HUD, {style_tag}, "
+            f"wide shot, clean composition"
         )
 
     @staticmethod
-    def build_sprite_prompt(subject: str, style: str = "pixel_art",
-                             facing: str = "front") -> str:
+    def build_sprite_prompt(
+        subject: str,
+        style: str = "pixel_art",
+        facing: str = "front",
+    ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
         return (
-            f"{subject}, {facing} facing, full body, isolated on white background, "
-            f"transparent background, game sprite, {style_tag}, clean edges"
+            f"{subject}, {facing} facing, full body, single centered object, "
+            f"isolated, transparent background if possible, game sprite, "
+            f"{style_tag}, clean silhouette, no scenery"
         )
 
     @staticmethod
-    def build_tilesheet_prompt(subject: str, style: str = "pixel_art",
-                                frames: int = 10) -> str:
+    def build_animation_frame_prompt(
+        subject: str,
+        action: str,
+        frame_index: int,
+        frame_count: int,
+        style: str = "pixel_art",
+    ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
         return (
-            f"sprite sheet of {subject}, {frames} animation frames in a row, "
-            f"horizontal layout, evenly spaced, same size each frame, "
-            f"white background, game animation, {style_tag}"
+            f"{subject}, {action} animation frame {frame_index + 1} of {frame_count}, "
+            f"single character pose, centered, same scale, isolated, white or transparent background, "
+            f"game sprite animation, {style_tag}, clean silhouette"
         )
 
     @staticmethod
     def build_pixel_art_prompt(subject: str) -> str:
         return (
-            f"{subject}, pure pixel art, 8-bit retro, low resolution look, "
-            f"limited color palette, hard pixel edges, no gradients, "
-            f"classic NES/SNES style"
+            f"{subject}, pure pixel art game asset, 8-bit retro, limited color palette, "
+            f"hard pixel edges, no gradients, clean silhouette, classic NES/SNES style"
         )
 
     @staticmethod
     def get_negative_prompt(asset_type: str = "general") -> str:
         extras = {
             "background": ", characters, people, HUD, UI elements",
-            "sprite":     ", background scenery, multiple poses",
-            "tilesheet":  ", merged frames, uneven spacing",
+            "sprite": ", background scenery, multiple objects, multiple poses",
+            "sprite_sheet": ", merged frames, uneven spacing, different character scale",
         }
         return PromptOptimizer.NEGATIVE_BASE + extras.get(asset_type, "")
 
 
-# ─────────────────────────────────────────────
-# IMAGE GENERATOR (gọi Pollinations.ai)
-# ─────────────────────────────────────────────
+class PollinationsProvider:
+    """Pollinations image provider adapter."""
+
+    name = "pollinations"
+
+    def __init__(
+        self,
+        api_key: str = API_KEY,
+        model: str = "flux",
+        base_url: str = POLLINATIONS_BASE_URL,
+        timeout: int = 90,
+        retries: int = 3,
+        private: bool = True,
+        enhance: bool = False,
+        nologo: bool = True,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.retries = retries
+        self.private = private
+        self.enhance = enhance
+        self.nologo = nologo
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        width: int,
+        height: int,
+        seed: int = -1,
+        negative_prompt: str | None = None,
+    ) -> ProviderResult:
+        actual_seed = seed if seed >= 0 else int(time.time() * 1000) % 2_147_483_647
+        full_prompt = prompt
+        if negative_prompt:
+            full_prompt = f"{prompt}. Avoid: {negative_prompt}"
+
+        url = f"{self.base_url}/{quote(full_prompt)}"
+        params: dict[str, Any] = {
+            "model": self.model,
+            "width": width,
+            "height": height,
+            "seed": actual_seed,
+            "nologo": str(self.nologo).lower(),
+            "private": str(self.private).lower(),
+            "enhance": str(self.enhance).lower(),
+        }
+        if self.api_key:
+            # Pollinations deployments have used both key/token naming; sending both is harmless for GET params.
+            params["key"] = self.api_key
+            params["token"] = self.api_key
+
+        last_error: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = requests.get(url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+
+                content_type = response.headers.get("content-type", "")
+                if "image" not in content_type.lower():
+                    preview = response.text[:200]
+                    raise RuntimeError(f"Provider did not return an image. Content-Type={content_type}. Body={preview!r}")
+
+                image = Image.open(io.BytesIO(response.content)).convert("RGBA")
+                warnings: list[str] = []
+                if image.size != (width, height):
+                    warnings.append(
+                        f"Provider returned {image.size[0]}x{image.size[1]} instead of requested {width}x{height}; post-processed locally."
+                    )
+                return ProviderResult(
+                    image=image,
+                    provider=self.name,
+                    model=self.model,
+                    seed=actual_seed,
+                    warnings=warnings,
+                )
+            except (requests.RequestException, UnidentifiedImageError, RuntimeError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(2 * attempt)
+
+        raise RuntimeError(f"Cannot generate image after {self.retries} attempts: {last_error}") from last_error
+
 
 class ImageGenerator:
-    """
-    Wrapper gọi Pollinations.ai Image API và trả về PIL.Image.
-    """
+    """Backward-compatible wrapper around the selected provider."""
 
-    def __init__(self, api_key: str = API_KEY, model: str = "flux"):
-        self.api_key = api_key
-        self.model   = model
-        # self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self.headers = {}
+    def __init__(self, api_key: str = API_KEY, model: str = "flux", provider: AIImageProvider | None = None):
+        self.provider = provider or PollinationsProvider(api_key=api_key, model=model)
 
-    # def generate(self, prompt: str, width: int = 512, height: int = 512,
-    #              seed: int = -1, retries: int = 3) -> Image.Image:
-    #     """
-    #     Gọi API sinh ảnh, trả về PIL Image.
-    #     seed=-1 → random mỗi lần; seed cố định → kết quả reproducible.
-    #     """
-    #     encoded = quote(prompt)
-    #     url = f"{BASE_URL}/{encoded}"
-    #     params = {
-    #         "model":  self.model,
-    #         "width":  width,
-    #         "height": height,
-    #         "seed":   seed if seed >= 0 else int(time.time()),
-    #         "nologo": "true",
-    #     }
-    #     if self.api_key:
-    #         params["key"] = self.api_key
+    def generate(
+        self,
+        prompt: str,
+        width: int = 512,
+        height: int = 512,
+        seed: int = -1,
+        negative_prompt: str | None = None,
+    ) -> Image.Image:
+        return self.generate_with_metadata(
+            prompt,
+            width=width,
+            height=height,
+            seed=seed,
+            negative_prompt=negative_prompt,
+        ).image
 
-    #     for attempt in range(1, retries + 1):
-    #         try:
-    #             print(f"  [Gen] Attempt {attempt}/{retries} — {width}×{height}...")
-    #             resp = requests.get(url, params=params, headers=self.headers, timeout=60)
-    #             resp.raise_for_status()
-    #             img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-    #             print(f"  [Gen] ✓ Received {img.size}")
-    #             return img
-    #         except requests.exceptions.RequestException as e:
-    #             print(f"  [Gen] ✗ Error: {e}")
-    #             if attempt < retries:
-    #                 time.sleep(5 * attempt)
-    #             else:
-    #                 raise RuntimeError(f"Không thể sinh ảnh sau {retries} lần thử.") from e
-
-    def generate(self, prompt: str) -> Image.Image:
-
-        encoded = quote(prompt)
-
-        url = f"{BASE_URL}/{encoded}"
-
-        print("[DEBUG] URL =", url)
-
-        response = requests.get(
-            url,
-            timeout=60
+    def generate_with_metadata(
+        self,
+        prompt: str,
+        *,
+        width: int,
+        height: int,
+        seed: int = -1,
+        negative_prompt: str | None = None,
+    ) -> ProviderResult:
+        return self.provider.generate(
+            prompt,
+            width=width,
+            height=height,
+            seed=seed,
+            negative_prompt=negative_prompt,
         )
 
-        response.raise_for_status()
-
-        img = Image.open(
-            io.BytesIO(response.content)
-        ).convert("RGBA")
-
-        return img
-
-# ─────────────────────────────────────────────
-# POST-PROCESSOR
-# ─────────────────────────────────────────────
 
 class AssetPostProcessor:
-    """
-    Xử lý ảnh sau khi sinh: resize, pixel-art effect, cắt tilesheet.
-    """
+    """Post-process images into predictable game asset outputs."""
 
     @staticmethod
-    def resize_to_standard(img: Image.Image, asset_type: str) -> Image.Image:
+    def fit_to_canvas(
+        img: Image.Image,
+        target_size: tuple[int, int],
+        *,
+        resample: Image.Resampling = Image.Resampling.LANCZOS,
+        background: tuple[int, int, int, int] = (0, 0, 0, 0),
+    ) -> Image.Image:
+        """Keep aspect ratio and center image on a fixed-size transparent canvas."""
+        img = img.convert("RGBA")
+        fitted = ImageOps.contain(img, target_size, method=resample)
+        canvas = Image.new("RGBA", target_size, background)
+        x = (target_size[0] - fitted.width) // 2
+        y = (target_size[1] - fitted.height) // 2
+        canvas.alpha_composite(fitted, (x, y))
+        return canvas
+
+    @staticmethod
+    def cover_to_canvas(
+        img: Image.Image,
+        target_size: tuple[int, int],
+        *,
+        resample: Image.Resampling = Image.Resampling.LANCZOS,
+    ) -> Image.Image:
+        """Fill target canvas without distortion, cropping overflow."""
+        return ImageOps.fit(img.convert("RGBA"), target_size, method=resample, centering=(0.5, 0.5))
+
+    @staticmethod
+    def resize_to_standard(
+        img: Image.Image,
+        asset_type: str,
+        *,
+        mode: str = "contain",
+        pixel_art: bool = False,
+    ) -> Image.Image:
         target = ASSET_SIZES.get(asset_type)
         if not target:
-            raise ValueError(f"Không tìm thấy kích thước cho '{asset_type}'. "
-                             f"Các loại hợp lệ: {list(ASSET_SIZES)}")
-        return img.resize(target, Image.LANCZOS)
+            raise ValueError(f"Unknown size key '{asset_type}'. Valid keys: {list(ASSET_SIZES)}")
+
+        resample = Image.Resampling.NEAREST if pixel_art else Image.Resampling.LANCZOS
+        if mode == "cover":
+            return AssetPostProcessor.cover_to_canvas(img, target, resample=resample)
+        if mode == "contain":
+            return AssetPostProcessor.fit_to_canvas(img, target, resample=resample)
+        raise ValueError("mode must be either 'contain' or 'cover'")
 
     @staticmethod
     def apply_pixel_art_effect(img: Image.Image, block_size: int = 8) -> Image.Image:
-        """
-        Pixelate ảnh: thu nhỏ rồi scale lại → hiệu ứng pixel thô.
-        """
-        w, h  = img.size
-        small = img.resize((w // block_size, h // block_size), Image.NEAREST)
-        return small.resize((w, h), Image.NEAREST)
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1")
+
+        img = img.convert("RGBA")
+        w, h = img.size
+        small_w = max(1, w // block_size)
+        small_h = max(1, h // block_size)
+        small = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        return small.resize((w, h), Image.Resampling.NEAREST)
 
     @staticmethod
     def reduce_palette(img: Image.Image, colors: int = 32) -> Image.Image:
-        """Giảm số màu → giống hơn 8-bit asset."""
+        if colors < 2 or colors > 256:
+            raise ValueError("colors must be between 2 and 256")
+
+        img = img.convert("RGBA")
+        alpha = img.getchannel("A")
         rgb = img.convert("RGB")
         reduced = rgb.quantize(colors=colors).convert("RGBA")
+        reduced.putalpha(alpha)
         return reduced
 
     @staticmethod
-    def remove_white_background(img: Image.Image, threshold: int = 240) -> Image.Image:
-        """
-        Chuyển pixel trắng/gần trắng thành trong suốt — hữu ích cho sprite.
-        """
+    def remove_background(img: Image.Image, threshold: int = 245) -> Image.Image:
+        """Remove background. Use rembg if installed; otherwise fall back to near-white removal."""
         img = img.convert("RGBA")
-        data = img.getdata()
-        new_data = []
-        for r, g, b, a in data:
-            if r > threshold and g > threshold and b > threshold:
-                new_data.append((255, 255, 255, 0))
+        try:
+            from rembg import remove  # type: ignore
+
+            return remove(img).convert("RGBA")
+        except Exception:
+            return AssetPostProcessor.remove_near_white_background(img, threshold=threshold)
+
+    @staticmethod
+    def remove_near_white_background(img: Image.Image, threshold: int = 245) -> Image.Image:
+        img = img.convert("RGBA")
+        pixels = []
+        for r, g, b, a in img.getdata():
+            if r >= threshold and g >= threshold and b >= threshold:
+                pixels.append((r, g, b, 0))
             else:
-                new_data.append((r, g, b, a))
-        img.putdata(new_data)
+                pixels.append((r, g, b, a))
+        img.putdata(pixels)
         return img
 
     @staticmethod
-    def slice_tilesheet(img: Image.Image, frames: int = 10) -> list[Image.Image]:
-        """
-        Cắt tilesheet ngang thành danh sách frame riêng lẻ.
-        """
-        w, h = img.size
-        frame_w = w // frames
-        slices = []
-        for i in range(frames):
-            box = (i * frame_w, 0, (i + 1) * frame_w, h)
-            slices.append(img.crop(box))
-        return slices
+    def compose_sprite_sheet(frames: list[Image.Image], frame_size: tuple[int, int]) -> Image.Image:
+        if not frames:
+            raise ValueError("frames cannot be empty")
+
+        frame_w, frame_h = frame_size
+        sheet = Image.new("RGBA", (frame_w * len(frames), frame_h), (0, 0, 0, 0))
+        for index, frame in enumerate(frames):
+            normalized = AssetPostProcessor.fit_to_canvas(
+                frame,
+                frame_size,
+                resample=Image.Resampling.NEAREST,
+            )
+            sheet.alpha_composite(normalized, (index * frame_w, 0))
+        return sheet
+
+    @staticmethod
+    def slice_sprite_sheet(img: Image.Image, frames: int, frame_size: tuple[int, int]) -> list[Image.Image]:
+        frame_w, frame_h = frame_size
+        expected_w = frames * frame_w
+        if img.size != (expected_w, frame_h):
+            raise ValueError(f"Expected sprite sheet {expected_w}x{frame_h}, got {img.size[0]}x{img.size[1]}")
+
+        return [
+            img.crop((index * frame_w, 0, (index + 1) * frame_w, frame_h))
+            for index in range(frames)
+        ]
 
     @staticmethod
     def save(img: Image.Image, path: Path, fmt: str = "PNG") -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(path, fmt)
-        print(f"  [Save] ✓ {path}")
 
-
-# ─────────────────────────────────────────────
-# ASSET STUDIO — FACADE CHÍNH
-# ─────────────────────────────────────────────
 
 class GameAssetStudio:
-    """
-    Lớp chính, tổng hợp PromptOptimizer + ImageGenerator + PostProcessor.
-    Khôi & Hậu sẽ gọi các hàm này từ backend.
-    """
+    """Facade used by backend/web integration code."""
 
-    def __init__(self, api_key: str = API_KEY, model: str = "flux",
-                 output_dir: str = "output"):
-        self.gen   = ImageGenerator(api_key=api_key, model=model)
-        self.proc  = AssetPostProcessor()
-        self.out   = Path(output_dir)
+    def __init__(
+        self,
+        api_key: str = API_KEY,
+        model: str = "flux",
+        output_dir: str | Path = OUTPUT_DIR,
+        provider: AIImageProvider | None = None,
+    ):
+        self.gen = ImageGenerator(api_key=api_key, model=model, provider=provider)
+        self.proc = AssetPostProcessor()
+        self.out = Path(output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Background ──────────────────────────────────────────────
-    def generate_background(self, subject: str, size_key: str = "background_hd",
-                             style: str = "pixel_art", time_of_day: str = "day",
-                             seed: int = -1, filename: str = None) -> Path:
-        """
-        Sinh background với kích thước chuẩn.
-        Ví dụ: studio.generate_background("forest with waterfall", size_key="background_hd")
-        """
-        print(f"\n🌄 Generating background: '{subject}' [{size_key}]")
-        prompt   = PromptOptimizer.build_background_prompt(subject, style, time_of_day)
-        w, h     = ASSET_SIZES[size_key]
-        img      = self.gen.generate(prompt)
-        img      = self.proc.resize_to_standard(img, size_key)
+    def generate_background(
+        self,
+        subject: str,
+        size_key: str = "background_hd",
+        style: str = "pixel_art",
+        time_of_day: str = "day",
+        seed: int = -1,
+        filename: str | None = None,
+    ) -> GeneratedAsset:
+        self._validate_size_key(size_key, BACKGROUND_SIZE_KEYS, "background")
+        width, height = ASSET_SIZES[size_key]
+        prompt = PromptOptimizer.build_background_prompt(subject, style, time_of_day)
+        result = self.gen.generate_with_metadata(
+            prompt,
+            width=width,
+            height=height,
+            seed=seed,
+            negative_prompt=PromptOptimizer.get_negative_prompt("background"),
+        )
+        img = self.proc.cover_to_canvas(result.image, (width, height))
 
-        out_name = filename or self._safe_name(f"bg_{subject}_{size_key}")
-        path     = self.out / "backgrounds" / f"{out_name}.png"
+        out_name = self._safe_name(filename or f"bg_{subject}_{size_key}")
+        path = self.out / "backgrounds" / f"{out_name}.png"
         self.proc.save(img, path)
-        return path
+        return self._asset_metadata("background", prompt, result, img, path)
 
-    # ── 2. Sprite ──────────────────────────────────────────────────
-    def generate_sprite(self, subject: str, size_key: str = "sprite_medium",
-                        style: str = "pixel_art", facing: str = "front",
-                        transparent_bg: bool = True, seed: int = -1,
-                        filename: str = None) -> Path:
-        """
-        Sinh sprite nhân vật / đồ vật.
-        """
-        print(f"\n🧑 Generating sprite: '{subject}' [{size_key}]")
+    def generate_sprite(
+        self,
+        subject: str,
+        size_key: str = "sprite_medium",
+        style: str = "pixel_art",
+        facing: str = "front",
+        transparent_bg: bool = True,
+        seed: int = -1,
+        filename: str | None = None,
+    ) -> GeneratedAsset:
+        self._validate_size_key(size_key, SPRITE_SIZE_KEYS, "sprite")
+        width, height = ASSET_SIZES[size_key]
         prompt = PromptOptimizer.build_sprite_prompt(subject, style, facing)
-        w, h   = ASSET_SIZES[size_key]
-        img    = self.gen.generate(prompt)
-        img    = self.proc.resize_to_standard(img, size_key)
+        result = self.gen.generate_with_metadata(
+            prompt,
+            width=max(width, 512),
+            height=max(height, 512),
+            seed=seed,
+            negative_prompt=PromptOptimizer.get_negative_prompt("sprite"),
+        )
 
+        img = result.image
         if transparent_bg:
-            img = self.proc.remove_white_background(img)
+            img = self.proc.remove_background(img)
+        img = self.proc.fit_to_canvas(
+            img,
+            (width, height),
+            resample=Image.Resampling.NEAREST if style == "pixel_art" else Image.Resampling.LANCZOS,
+        )
 
-        out_name = filename or self._safe_name(f"sprite_{subject}_{size_key}")
-        path     = self.out / "sprites" / f"{out_name}.png"
+        out_name = self._safe_name(filename or f"sprite_{subject}_{size_key}")
+        path = self.out / "sprites" / f"{out_name}.png"
         self.proc.save(img, path)
-        return path
+        return self._asset_metadata("sprite", prompt, result, img, path)
 
-    # ── 3. Pixel Art ───────────────────────────────────────────────
-    def generate_pixel_art(self, subject: str, size_key: str = "sprite_medium",
-                            block_size: int = 8, colors: int = 32,
-                            seed: int = -1, filename: str = None) -> Path:
-        """
-        Sinh ảnh rồi áp dụng bộ lọc pixel-art + giảm palette.
-        """
-        print(f"\n🎮 Generating pixel art: '{subject}'")
+    def generate_pixel_art(
+        self,
+        subject: str,
+        size_key: str = "sprite_medium",
+        block_size: int = 8,
+        colors: int = 32,
+        seed: int = -1,
+        filename: str | None = None,
+    ) -> GeneratedAsset:
+        self._validate_size_key(size_key, PIXEL_SIZE_KEYS, "pixel art")
+        width, height = ASSET_SIZES[size_key]
         prompt = PromptOptimizer.build_pixel_art_prompt(subject)
-        w, h   = ASSET_SIZES[size_key]
-        img    = self.gen.generate(prompt)
-        img    = self.proc.resize_to_standard(img, size_key)
-        img    = self.proc.apply_pixel_art_effect(img, block_size=block_size)
-        img    = self.proc.reduce_palette(img, colors=colors)
+        result = self.gen.generate_with_metadata(
+            prompt,
+            width=max(width, 512),
+            height=max(height, 512),
+            seed=seed,
+            negative_prompt=PromptOptimizer.get_negative_prompt("sprite"),
+        )
 
-        out_name = filename or self._safe_name(f"pixel_{subject}")
-        path     = self.out / "pixel_art" / f"{out_name}.png"
+        img = self.proc.fit_to_canvas(result.image, (width, height), resample=Image.Resampling.NEAREST)
+        img = self.proc.apply_pixel_art_effect(img, block_size=block_size)
+        img = self.proc.reduce_palette(img, colors=colors)
+
+        out_name = self._safe_name(filename or f"pixel_{subject}_{size_key}")
+        path = self.out / "pixel_art" / f"{out_name}.png"
         self.proc.save(img, path)
-        return path
+        return self._asset_metadata("pixel_art", prompt, result, img, path)
 
-    # ── 4. Tilesheet (animation) ───────────────────────────────────
-    def generate_tilesheet(self, subject: str, frames: int = 10,
-                            style: str = "pixel_art", seed: int = -1,
-                            slice_frames: bool = False,
-                            filename: str = None) -> Path:
-        """
-        Sinh tilesheet gồm N frame animation liên tiếp theo chiều ngang.
-        Nếu slice_frames=True, cũng lưu từng frame riêng lẻ vào thư mục con.
-        """
-        print(f"\n🎞  Generating tilesheet: '{subject}' ({frames} frames)")
-        prompt  = PromptOptimizer.build_tilesheet_prompt(subject, style, frames)
-        # Tilesheet: chiều rộng = frames * frame_width, chiều cao cố định 512
-        frame_w = 64          # 64px mỗi frame → phù hợp Scratch/Gamemaker
-        total_w = frame_w * frames
-        img     = self.gen.generate(prompt)
+    def convert_image_to_pixel_art(
+        self,
+        image_path: str | Path,
+        size_key: str = "sprite_medium",
+        block_size: int = 8,
+        colors: int = 32,
+        filename: str | None = None,
+    ) -> GeneratedAsset:
+        """Deterministic local image-to-pixel pipeline for uploaded HD assets."""
+        self._validate_size_key(size_key, PIXEL_SIZE_KEYS, "pixel art")
+        width, height = ASSET_SIZES[size_key]
+        source = Path(image_path)
+        img = Image.open(source).convert("RGBA")
+        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.NEAREST)
+        img = self.proc.apply_pixel_art_effect(img, block_size=block_size)
+        img = self.proc.reduce_palette(img, colors=colors)
 
-        out_name = filename or self._safe_name(f"tilesheet_{subject}_{frames}f")
-        path     = self.out / "tilesheets" / f"{out_name}.png"
+        out_name = self._safe_name(filename or f"pixel_from_{source.stem}_{size_key}")
+        path = self.out / "pixel_art" / f"{out_name}.png"
         self.proc.save(img, path)
 
-        if slice_frames:
-            slices   = self.proc.slice_tilesheet(img, frames=frames)
-            frame_dir = self.out / "tilesheets" / out_name
-            for i, frame in enumerate(slices):
-                self.proc.save(frame, frame_dir / f"frame_{i:02d}.png")
-            print(f"  [Slice] ✓ {frames} frames lưu vào {frame_dir}")
+        result = ProviderResult(
+            image=img,
+            provider="local_postprocess",
+            model="pillow_pixel_pipeline",
+            seed=-1,
+        )
+        return self._asset_metadata("pixel_art", f"convert image to pixel art: {source.name}", result, img, path)
 
-        return path
+    def generate_tilesheet(
+        self,
+        subject: str,
+        frames: int = 10,
+        style: str = "pixel_art",
+        seed: int = -1,
+        slice_frames: bool = False,
+        filename: str | None = None,
+        frame_size: tuple[int, int] = (64, 64),
+        action: str = "running",
+    ) -> GeneratedAsset:
+        """Generate each animation frame, normalize it, then compose a deterministic horizontal sheet."""
+        if frames < 1 or frames > 32:
+            raise ValueError("frames must be between 1 and 32")
+        if frame_size[0] < 16 or frame_size[1] < 16:
+            raise ValueError("frame_size must be at least 16x16")
 
-    # ── Helper ─────────────────────────────────────────────────────
+        generated_frames: list[Image.Image] = []
+        warnings: list[str] = []
+        provider_name = ""
+        model = ""
+        used_seed = seed
+
+        for index in range(frames):
+            frame_seed = seed + index if seed >= 0 else -1
+            prompt = PromptOptimizer.build_animation_frame_prompt(subject, action, index, frames, style)
+            result = self.gen.generate_with_metadata(
+                prompt,
+                width=max(frame_size[0], 512),
+                height=max(frame_size[1], 512),
+                seed=frame_seed,
+                negative_prompt=PromptOptimizer.get_negative_prompt("sprite_sheet"),
+            )
+            provider_name = result.provider
+            model = result.model
+            if index == 0:
+                used_seed = result.seed
+            warnings.extend(result.warnings)
+
+            frame = self.proc.remove_background(result.image)
+            frame = self.proc.fit_to_canvas(
+                frame,
+                frame_size,
+                resample=Image.Resampling.NEAREST if style == "pixel_art" else Image.Resampling.LANCZOS,
+            )
+            generated_frames.append(frame)
+
+        sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
+        out_name = self._safe_name(filename or f"spritesheet_{subject}_{action}_{frames}f")
+        path = self.out / "tilesheets" / f"{out_name}.png"
+        self.proc.save(sheet, path)
+
+        frame_meta: list[FrameMetadata] = []
+        for index, frame in enumerate(generated_frames):
+            frame_path: Path | None = None
+            if slice_frames:
+                frame_path = self.out / "tilesheets" / out_name / f"frame_{index:02d}.png"
+                self.proc.save(frame, frame_path)
+            frame_meta.append(
+                FrameMetadata(
+                    index=index,
+                    x=index * frame_size[0],
+                    y=0,
+                    w=frame_size[0],
+                    h=frame_size[1],
+                    file_path=str(frame_path) if frame_path else None,
+                )
+            )
+
+        prompt_summary = f"{subject}, {action}, {frames} frames, {style}"
+        return GeneratedAsset(
+            asset_id=str(uuid.uuid4()),
+            asset_type="sprite_sheet",
+            prompt=prompt_summary,
+            provider=provider_name,
+            model=model,
+            seed=used_seed,
+            width=sheet.width,
+            height=sheet.height,
+            format="png",
+            file_path=str(path),
+            has_alpha=True,
+            frames=frame_meta,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _validate_size_key(size_key: str, allowed: set[str], label: str) -> None:
+        if size_key not in allowed:
+            raise ValueError(f"Invalid {label} size '{size_key}'. Valid values: {sorted(allowed)}")
+
     @staticmethod
     def _safe_name(name: str) -> str:
-        """Chuyển tên thành slug an toàn cho filesystem."""
-        return re.sub(r"[^a-zA-Z0-9_\-]", "_", name.lower())[:80]
+        slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", name.lower()).strip("_")
+        return slug[:80] or "asset"
 
+    @staticmethod
+    def _asset_metadata(
+        asset_type: str,
+        prompt: str,
+        result: ProviderResult,
+        img: Image.Image,
+        path: Path,
+    ) -> GeneratedAsset:
+        has_alpha = img.mode == "RGBA" and img.getextrema()[3][0] < 255
+        return GeneratedAsset(
+            asset_id=str(uuid.uuid4()),
+            asset_type=asset_type,
+            prompt=prompt,
+            provider=result.provider,
+            model=result.model,
+            seed=result.seed,
+            width=img.width,
+            height=img.height,
+            format="png",
+            file_path=str(path),
+            has_alpha=has_alpha,
+            warnings=result.warnings,
+        )
 
-# ─────────────────────────────────────────────
-# DEMO / QUICK TEST
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     studio = GameAssetStudio(
@@ -365,41 +701,7 @@ if __name__ == "__main__":
         output_dir="output",
     )
 
-    # --- Test 1: Background cho khóa Scratch ---
-    studio.generate_background(
-        subject="fantasy forest with mushrooms and glowing fireflies",
-        size_key="background_sd",   # 1280x720 phù hợp Scratch
-        style="pixel_art",
-        time_of_day="night",
-        seed=42,
-    )
-
-    # --- Test 2: Sprite nhân vật ---
-    studio.generate_sprite(
-        subject="cute wizard character",
-        size_key="sprite_medium",   # 128x128
-        style="pixel_art",
-        facing="front",
-        transparent_bg=True,
-        seed=42,
-    )
-
-    # --- Test 3: Pixel Art item ---
-    studio.generate_pixel_art(
-        subject="treasure chest",
-        size_key="sprite_small",    # 64x64
-        block_size=4,
-        colors=16,
-        seed=42,
-    )
-
-    # --- Test 4: Tilesheet chạy bộ 10 frame ---
-    studio.generate_tilesheet(
-        subject="running robot character",
-        frames=10,
-        style="pixel_art",
-        seed=42,
-        slice_frames=True,          # cũng cắt frame lẻ
-    )
-
-    print("\n✅ Xong! Kiểm tra thư mục output/")
+    print(studio.generate_background("fantasy forest with mushrooms and glowing fireflies", "background_sd", "pixel_art", "night", seed=42).to_dict())
+    print(studio.generate_sprite("cute wizard character", "sprite_medium", "pixel_art", "front", True, seed=42).to_dict())
+    print(studio.generate_pixel_art("treasure chest", "sprite_small", block_size=4, colors=16, seed=42).to_dict())
+    print(studio.generate_tilesheet("running robot character", frames=10, style="pixel_art", seed=42, slice_frames=True).to_dict())

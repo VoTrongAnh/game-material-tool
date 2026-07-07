@@ -1,97 +1,142 @@
 """
-CLI nhanh cho AI Game Asset Studio
-Dùng khi test / demo không cần code Python trực tiếp.
+Quick CLI for AI Game Asset Studio.
 
-Ví dụ dùng:
+Examples:
   python cli.py background "dark dungeon cave" --size background_sd --style pixel_art
   python cli.py sprite "knight warrior" --size sprite_medium --transparent
   python cli.py pixel "gold coin" --size sprite_small --block 4
-  python cli.py tilesheet "walking cat" --frames 10 --slice
+  python cli.py pixel-from-image "./input.png" --size sprite_small --block 4
+  python cli.py tilesheet "walking cat" --frames 10 --frame-width 64 --frame-height 64 --slice
 """
 
-import argparse
-import os
-from asset_generator import GameAssetStudio, ASSET_SIZES
+from __future__ import annotations
 
-def main():
+import argparse
+import json
+import os
+
+from asset_generator import (
+    BACKGROUND_SIZE_KEYS,
+    PIXEL_SIZE_KEYS,
+    SPRITE_SIZE_KEYS,
+    GameAssetStudio,
+)
+
+
+STYLE_CHOICES = ["pixel_art", "cartoon", "realistic", "chibi"]
+
+
+def print_asset(asset) -> None:
+    print(f"\nAsset saved: {asset.file_path}")
+    print(json.dumps(asset.to_dict(), ensure_ascii=False, indent=2))
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         prog="game-asset",
-        description="🎮 AI Game Asset Studio — sinh asset từ Pollinations.ai"
+        description="AI Game Asset Studio - generate embeddable game assets",
     )
+    parser.add_argument("--model", default="flux", help="Image model/provider model name")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ── background ──────────────────────────────────────────────────
-    p_bg = sub.add_parser("background", help="Sinh background")
-    p_bg.add_argument("subject", help="Mô tả scene, vd: 'forest with river'")
-    p_bg.add_argument("--size",    default="background_hd", choices=list(ASSET_SIZES))
-    p_bg.add_argument("--style",   default="pixel_art",
-                      choices=["pixel_art","cartoon","realistic","chibi"])
-    p_bg.add_argument("--time",    default="day",
-                      choices=["day","night","dusk","dawn"])
-    p_bg.add_argument("--seed",    type=int, default=-1)
-    p_bg.add_argument("--out",     default="output")
+    p_bg = sub.add_parser("background", help="Generate a game background")
+    p_bg.add_argument("subject", help="Scene description, e.g. 'forest with river'")
+    p_bg.add_argument("--size", default="background_hd", choices=sorted(BACKGROUND_SIZE_KEYS))
+    p_bg.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_bg.add_argument("--time", default="day", choices=["day", "night", "dusk", "dawn"])
+    p_bg.add_argument("--seed", type=int, default=-1)
+    p_bg.add_argument("--out", default="output")
 
-    # ── sprite ──────────────────────────────────────────────────────
-    p_sp = sub.add_parser("sprite", help="Sinh sprite nhân vật / vật phẩm")
-    p_sp.add_argument("subject", help="Mô tả sprite, vd: 'cute dragon'")
-    p_sp.add_argument("--size",        default="sprite_medium", choices=list(ASSET_SIZES))
-    p_sp.add_argument("--style",       default="pixel_art",
-                      choices=["pixel_art","cartoon","realistic","chibi"])
-    p_sp.add_argument("--facing",      default="front",
-                      choices=["front","side","back","three-quarter"])
+    p_sp = sub.add_parser("sprite", help="Generate a character/item sprite")
+    p_sp.add_argument("subject", help="Sprite description, e.g. 'cute dragon'")
+    p_sp.add_argument("--size", default="sprite_medium", choices=sorted(SPRITE_SIZE_KEYS))
+    p_sp.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_sp.add_argument("--facing", default="front", choices=["front", "side", "back", "three-quarter"])
     p_sp.add_argument("--transparent", action="store_true")
-    p_sp.add_argument("--seed",        type=int, default=-1)
-    p_sp.add_argument("--out",         default="output")
+    p_sp.add_argument("--seed", type=int, default=-1)
+    p_sp.add_argument("--out", default="output")
 
-    # ── pixel art ───────────────────────────────────────────────────
-    p_px = sub.add_parser("pixel", help="Sinh pixel art / 8-bit")
-    p_px.add_argument("subject", help="Mô tả, vd: 'wooden shield'")
-    p_px.add_argument("--size",   default="sprite_medium", choices=list(ASSET_SIZES))
-    p_px.add_argument("--block",  type=int, default=8, help="Block size (4-16)")
-    p_px.add_argument("--colors", type=int, default=32, help="Số màu (8-64)")
-    p_px.add_argument("--seed",   type=int, default=-1)
-    p_px.add_argument("--out",    default="output")
+    p_px = sub.add_parser("pixel", help="Generate a text-to-pixel-art asset")
+    p_px.add_argument("subject", help="Description, e.g. 'wooden shield'")
+    p_px.add_argument("--size", default="sprite_medium", choices=sorted(PIXEL_SIZE_KEYS))
+    p_px.add_argument("--block", type=int, default=8, help="Pixel block size, e.g. 4-16")
+    p_px.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
+    p_px.add_argument("--seed", type=int, default=-1)
+    p_px.add_argument("--out", default="output")
 
-    # ── tilesheet ───────────────────────────────────────────────────
-    p_ts = sub.add_parser("tilesheet", help="Sinh tilesheet animation")
-    p_ts.add_argument("subject", help="Mô tả animation, vd: 'running warrior'")
+    p_px_img = sub.add_parser("pixel-from-image", help="Convert an existing image to pixel art")
+    p_px_img.add_argument("image_path", help="Input PNG/JPG/WebP path")
+    p_px_img.add_argument("--size", default="sprite_medium", choices=sorted(PIXEL_SIZE_KEYS))
+    p_px_img.add_argument("--block", type=int, default=8, help="Pixel block size, e.g. 4-16")
+    p_px_img.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
+    p_px_img.add_argument("--out", default="output")
+
+    p_ts = sub.add_parser("tilesheet", help="Generate a horizontal sprite animation sheet")
+    p_ts.add_argument("subject", help="Character/animation description, e.g. 'running warrior'")
     p_ts.add_argument("--frames", type=int, default=10)
-    p_ts.add_argument("--style",  default="pixel_art",
-                      choices=["pixel_art","cartoon","realistic","chibi"])
-    p_ts.add_argument("--seed",   type=int, default=-1)
-    p_ts.add_argument("--slice",  action="store_true", help="Cắt frame lẻ ra")
-    p_ts.add_argument("--out",    default="output")
+    p_ts.add_argument("--action", default="running")
+    p_ts.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_ts.add_argument("--frame-width", type=int, default=64)
+    p_ts.add_argument("--frame-height", type=int, default=64)
+    p_ts.add_argument("--seed", type=int, default=-1)
+    p_ts.add_argument("--slice", action="store_true", help="Also save each frame separately")
+    p_ts.add_argument("--out", default="output")
 
     args = parser.parse_args()
-
     studio = GameAssetStudio(
         api_key=os.getenv("POLLINATIONS_API_KEY", ""),
+        model=args.model,
         output_dir=args.out,
     )
 
     if args.command == "background":
-        path = studio.generate_background(
-            subject=args.subject, size_key=args.size,
-            style=args.style, time_of_day=args.time, seed=args.seed,
+        asset = studio.generate_background(
+            subject=args.subject,
+            size_key=args.size,
+            style=args.style,
+            time_of_day=args.time,
+            seed=args.seed,
         )
     elif args.command == "sprite":
-        path = studio.generate_sprite(
-            subject=args.subject, size_key=args.size,
-            style=args.style, facing=args.facing,
-            transparent_bg=args.transparent, seed=args.seed,
+        asset = studio.generate_sprite(
+            subject=args.subject,
+            size_key=args.size,
+            style=args.style,
+            facing=args.facing,
+            transparent_bg=args.transparent,
+            seed=args.seed,
         )
     elif args.command == "pixel":
-        path = studio.generate_pixel_art(
-            subject=args.subject, size_key=args.size,
-            block_size=args.block, colors=args.colors, seed=args.seed,
+        asset = studio.generate_pixel_art(
+            subject=args.subject,
+            size_key=args.size,
+            block_size=args.block,
+            colors=args.colors,
+            seed=args.seed,
+        )
+    elif args.command == "pixel-from-image":
+        asset = studio.convert_image_to_pixel_art(
+            image_path=args.image_path,
+            size_key=args.size,
+            block_size=args.block,
+            colors=args.colors,
         )
     elif args.command == "tilesheet":
-        path = studio.generate_tilesheet(
-            subject=args.subject, frames=args.frames,
-            style=args.style, seed=args.seed, slice_frames=args.slice,
+        asset = studio.generate_tilesheet(
+            subject=args.subject,
+            frames=args.frames,
+            style=args.style,
+            seed=args.seed,
+            slice_frames=args.slice,
+            frame_size=(args.frame_width, args.frame_height),
+            action=args.action,
         )
+    else:
+        parser.error(f"Unknown command: {args.command}")
+        return
 
-    print(f"\n🎉 Asset đã lưu: {path}")
+    print_asset(asset)
+
 
 if __name__ == "__main__":
     main()
