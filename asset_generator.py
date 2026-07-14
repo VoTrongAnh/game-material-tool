@@ -11,6 +11,8 @@ Scope:
 from __future__ import annotations
 
 import io
+import json
+import math
 import os
 import re
 import time
@@ -38,11 +40,74 @@ ASSET_SIZES: dict[str, tuple[int, int]] = {
     "sprite_medium": (128, 128),
     "sprite_large": (256, 256),
     "icon": (32, 32),
+    "tile_16": (16, 16),
+    "tile_24": (24, 24),
+    "tile_32": (32, 32),
+    "tile_48": (48, 48),
+    "tile_64": (64, 64),
 }
 
 BACKGROUND_SIZE_KEYS = {"background_hd", "background_4k", "background_sd", "background_sq"}
 SPRITE_SIZE_KEYS = {"sprite_small", "sprite_medium", "sprite_large", "icon"}
 PIXEL_SIZE_KEYS = SPRITE_SIZE_KEYS | {"background_sq"}
+TILE_SIZE_KEYS = {"tile_16", "tile_24", "tile_32", "tile_48", "tile_64"}
+
+
+# Ready-made tile lists for common GameMaker-style tilesets (grid packed,
+# one distinct tile subject per grid cell, transparent background).
+TILE_PRESETS: dict[str, list[str]] = {
+    "platformer_basic": [
+        "grass ground top edge tile",
+        "grass ground top-left corner tile",
+        "grass ground top-right corner tile",
+        "dirt ground fill tile",
+        "stone ground fill tile",
+        "wooden platform plank tile",
+        "wooden bridge plank tile",
+        "stone brick wall tile",
+        "water surface tile",
+        "water fill tile",
+        "lava surface tile",
+        "lava fill tile",
+        "tree trunk tile",
+        "tree leaves canopy tile",
+        "bush shrub tile",
+        "rock boulder tile",
+        "wooden crate tile",
+        "treasure chest tile",
+        "lit torch tile",
+        "wooden sign post tile",
+        "ladder tile",
+        "spike trap tile",
+        "gold coin tile",
+        "small flower decoration tile",
+    ],
+    "dungeon": [
+        "stone floor tile",
+        "cracked stone floor tile",
+        "stone wall tile",
+        "stone wall corner tile",
+        "wooden door tile",
+        "iron gate tile",
+        "torch on wall tile",
+        "stairs down tile",
+        "rubble debris tile",
+        "wooden barrel tile",
+        "treasure chest tile",
+        "skull decoration tile",
+    ],
+    "cave": [
+        "cave floor rock tile",
+        "cave wall rock tile",
+        "cave wall corner tile",
+        "stalactite tile",
+        "stalagmite tile",
+        "underground water pool tile",
+        "glowing crystal tile",
+        "mushroom decoration tile",
+        "mineral ore vein tile",
+    ],
+}
 
 
 @dataclass
@@ -53,6 +118,7 @@ class FrameMetadata:
     w: int
     h: int
     file_path: str | None = None
+    name: str | None = None
 
 
 @dataclass
@@ -174,11 +240,26 @@ class PromptOptimizer:
         )
 
     @staticmethod
+    def build_tile_prompt(subject: str, style: str = "pixel_art") -> str:
+        style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
+        return (
+            f"single {subject}, one isolated game tile asset for a tileset, "
+            f"square orthographic view, centered, flat even lighting, no drop shadow, "
+            f"no perspective distortion, fills the entire frame edge to edge, "
+            f"tileable/seamless edges, transparent background, {style_tag}, "
+            f"clean pixel grid, no text, no watermark, no ruler, no grid lines"
+        )
+
+    @staticmethod
     def get_negative_prompt(asset_type: str = "general") -> str:
         extras = {
             "background": ", characters, people, HUD, UI elements",
             "sprite": ", background scenery, multiple objects, multiple poses",
             "sprite_sheet": ", merged frames, uneven spacing, different character scale",
+            "tile": (
+                ", multiple tiles, full tileset, sprite sheet, grid lines, ruler, "
+                "perspective, isometric, drop shadow, background scenery, frame border"
+            ),
         }
         return PromptOptimizer.NEGATIVE_BASE + extras.get(asset_type, "")
 
@@ -422,6 +503,63 @@ class AssetPostProcessor:
         return sheet
 
     @staticmethod
+    def compose_grid(
+        tiles: list[Image.Image],
+        cell_size: tuple[int, int],
+        *,
+        columns: int,
+        margin: int = 0,
+        spacing: int = 0,
+        background: tuple[int, int, int, int] = (0, 0, 0, 0),
+    ) -> Image.Image:
+        """Pack tiles into a GameMaker/Tiled-style grid: fixed cell size, optional
+        margin (border around the whole sheet) and spacing (gutter between cells)."""
+        if not tiles:
+            raise ValueError("tiles cannot be empty")
+        if columns < 1:
+            raise ValueError("columns must be >= 1")
+
+        cell_w, cell_h = cell_size
+        rows = math.ceil(len(tiles) / columns)
+        sheet_w = margin * 2 + columns * cell_w + (columns - 1) * spacing
+        sheet_h = margin * 2 + rows * cell_h + (rows - 1) * spacing
+        sheet = Image.new("RGBA", (sheet_w, sheet_h), background)
+
+        for index, tile in enumerate(tiles):
+            col = index % columns
+            row = index // columns
+            x = margin + col * (cell_w + spacing)
+            y = margin + row * (cell_h + spacing)
+            normalized = AssetPostProcessor.fit_to_canvas(
+                tile,
+                cell_size,
+                resample=Image.Resampling.NEAREST,
+            )
+            sheet.alpha_composite(normalized, (x, y))
+        return sheet
+
+    @staticmethod
+    def slice_grid(
+        img: Image.Image,
+        tile_count: int,
+        cell_size: tuple[int, int],
+        *,
+        columns: int,
+        margin: int = 0,
+        spacing: int = 0,
+    ) -> list[Image.Image]:
+        """Inverse of compose_grid: cut a packed tileset image back into individual tiles."""
+        cell_w, cell_h = cell_size
+        tiles = []
+        for index in range(tile_count):
+            col = index % columns
+            row = index // columns
+            x = margin + col * (cell_w + spacing)
+            y = margin + row * (cell_h + spacing)
+            tiles.append(img.crop((x, y, x + cell_w, y + cell_h)))
+        return tiles
+
+    @staticmethod
     def slice_sprite_sheet(img: Image.Image, frames: int, frame_size: tuple[int, int]) -> list[Image.Image]:
         frame_w, frame_h = frame_size
         expected_w = frames * frame_w
@@ -659,6 +797,141 @@ class GameAssetStudio:
             warnings=warnings,
         )
 
+    def generate_tileset(
+        self,
+        tiles: list[str] | None = None,
+        preset: str | None = None,
+        columns: int = 8,
+        cell_key: str = "tile_32",
+        style: str = "pixel_art",
+        seed: int = -1,
+        margin: int = 0,
+        spacing: int = 1,
+        transparent_bg: bool = True,
+        slice_tiles: bool = False,
+        filename: str | None = None,
+    ) -> GeneratedAsset:
+        """Generate a grid-packed tileset: one distinct tile per subject, normalized
+        to a fixed cell size, composed into a single sheet ready to import as a
+        GameMaker/Tiled tileset (fixed tile_width/tile_height/columns/margin/spacing).
+
+        Also writes a `<name>.json` sidecar next to the PNG describing the grid
+        layout and the name/index/x/y of every tile, so the sheet can be wired up
+        programmatically instead of clicking through each cell by hand.
+        """
+        if preset and not tiles:
+            if preset not in TILE_PRESETS:
+                raise ValueError(f"Unknown preset '{preset}'. Valid presets: {sorted(TILE_PRESETS)}")
+            tiles = TILE_PRESETS[preset]
+        if not tiles:
+            raise ValueError("Provide at least one tile subject via `tiles`, or a `preset` name.")
+        if columns < 1:
+            raise ValueError("columns must be >= 1")
+
+        self._validate_size_key(cell_key, TILE_SIZE_KEYS, "tile")
+        cell_w, cell_h = ASSET_SIZES[cell_key]
+
+        generated_tiles: list[Image.Image] = []
+        warnings: list[str] = []
+        provider_name = ""
+        model = ""
+        used_seed = seed
+
+        for index, subject in enumerate(tiles):
+            tile_seed = seed + index if seed >= 0 else -1
+            prompt = PromptOptimizer.build_tile_prompt(subject, style)
+            result = self.gen.generate_with_metadata(
+                prompt,
+                width=max(cell_w, 512),
+                height=max(cell_h, 512),
+                seed=tile_seed,
+                negative_prompt=PromptOptimizer.get_negative_prompt("tile"),
+            )
+            provider_name = result.provider
+            model = result.model
+            if index == 0:
+                used_seed = result.seed
+            warnings.extend(result.warnings)
+
+            img = result.image
+            if transparent_bg:
+                img = self.proc.remove_background(img)
+            img = self.proc.fit_to_canvas(
+                img,
+                (cell_w, cell_h),
+                resample=Image.Resampling.NEAREST if style == "pixel_art" else Image.Resampling.LANCZOS,
+            )
+            generated_tiles.append(img)
+
+        sheet = self.proc.compose_grid(
+            generated_tiles,
+            (cell_w, cell_h),
+            columns=columns,
+            margin=margin,
+            spacing=spacing,
+        )
+
+        out_name = self._safe_name(filename or f"tileset_{preset or 'custom'}_{cell_key}")
+        path = self.out / "tilesets" / f"{out_name}.png"
+        self.proc.save(sheet, path)
+
+        rows = math.ceil(len(generated_tiles) / columns)
+        tile_meta: list[FrameMetadata] = []
+        for index, (subject, tile) in enumerate(zip(tiles, generated_tiles)):
+            col = index % columns
+            row = index // columns
+            x = margin + col * (cell_w + spacing)
+            y = margin + row * (cell_h + spacing)
+
+            tile_path: Path | None = None
+            if slice_tiles:
+                tile_path = self.out / "tilesets" / out_name / f"{index:03d}_{self._safe_name(subject)}.png"
+                self.proc.save(tile, tile_path)
+
+            tile_meta.append(
+                FrameMetadata(
+                    index=index,
+                    x=x,
+                    y=y,
+                    w=cell_w,
+                    h=cell_h,
+                    file_path=str(tile_path) if tile_path else None,
+                    name=subject,
+                )
+            )
+
+        meta_path = self.out / "tilesets" / f"{out_name}.json"
+        tileset_json = {
+            "image": str(path),
+            "tile_width": cell_w,
+            "tile_height": cell_h,
+            "columns": columns,
+            "rows": rows,
+            "margin": margin,
+            "spacing": spacing,
+            "tile_count": len(tiles),
+            "tiles": [asdict(meta) for meta in tile_meta],
+        }
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(tileset_json, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        prompt_summary = f"tileset ({preset or 'custom'}): {', '.join(tiles)} [{style}]"
+        return GeneratedAsset(
+            asset_id=str(uuid.uuid4()),
+            asset_type="tileset",
+            prompt=prompt_summary,
+            provider=provider_name,
+            model=model,
+            seed=used_seed,
+            width=sheet.width,
+            height=sheet.height,
+            format="png",
+            file_path=str(path),
+            has_alpha=True,
+            frames=tile_meta,
+            warnings=warnings,
+        )
+
     @staticmethod
     def _validate_size_key(size_key: str, allowed: set[str], label: str) -> None:
         if size_key not in allowed:
@@ -705,3 +978,4 @@ if __name__ == "__main__":
     print(studio.generate_sprite("cute wizard character", "sprite_medium", "pixel_art", "front", True, seed=42).to_dict())
     print(studio.generate_pixel_art("treasure chest", "sprite_small", block_size=4, colors=16, seed=42).to_dict())
     print(studio.generate_tilesheet("running robot character", frames=10, style="pixel_art", seed=42, slice_frames=True).to_dict())
+    print(studio.generate_tileset(preset="platformer_basic", columns=8, cell_key="tile_32", style="pixel_art", seed=42, slice_tiles=True).to_dict())

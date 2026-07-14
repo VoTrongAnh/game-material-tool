@@ -7,6 +7,8 @@ Examples:
   python cli.py pixel "gold coin" --size sprite_small --block 4
   python cli.py pixel-from-image "./input.png" --size sprite_small --block 4
   python cli.py tilesheet "walking cat" --frames 10 --frame-width 64 --frame-height 64 --slice
+  python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 --slice
+  python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ from asset_generator import (
     BACKGROUND_SIZE_KEYS,
     PIXEL_SIZE_KEYS,
     SPRITE_SIZE_KEYS,
+    TILE_PRESETS,
+    TILE_SIZE_KEYS,
     GameAssetStudio,
 )
 
@@ -82,6 +86,31 @@ def main() -> None:
     p_ts.add_argument("--slice", action="store_true", help="Also save each frame separately")
     p_ts.add_argument("--out", default="output")
 
+    p_tset = sub.add_parser(
+        "tileset",
+        help="Generate a grid-packed tileset (GameMaker/Tiled-ready sheet + JSON layout)",
+    )
+    p_tset.add_argument(
+        "tiles",
+        nargs="*",
+        help="One tile subject per grid cell, e.g. \"grass ground tile\" \"water tile\". "
+        "Omit if using --preset.",
+    )
+    p_tset.add_argument(
+        "--preset",
+        choices=sorted(TILE_PRESETS),
+        help="Use a built-in tile list instead of typing subjects manually.",
+    )
+    p_tset.add_argument("--columns", type=int, default=8, help="Number of tiles per row")
+    p_tset.add_argument("--cell-size", dest="cell_size", default="tile_32", choices=sorted(TILE_SIZE_KEYS))
+    p_tset.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_tset.add_argument("--margin", type=int, default=0, help="Border padding around the whole sheet, in px")
+    p_tset.add_argument("--spacing", type=int, default=1, help="Gutter between tiles, in px")
+    p_tset.add_argument("--no-transparent", dest="transparent", action="store_false", default=True)
+    p_tset.add_argument("--slice", action="store_true", help="Also save each tile as its own PNG")
+    p_tset.add_argument("--seed", type=int, default=-1)
+    p_tset.add_argument("--out", default="output")
+
     args = parser.parse_args()
     studio = GameAssetStudio(
         api_key=os.getenv("POLLINATIONS_API_KEY", ""),
@@ -130,6 +159,21 @@ def main() -> None:
             slice_frames=args.slice,
             frame_size=(args.frame_width, args.frame_height),
             action=args.action,
+        )
+    elif args.command == "tileset":
+        if not args.tiles and not args.preset:
+            parser.error("tileset requires either tile subjects or --preset")
+        asset = studio.generate_tileset(
+            tiles=args.tiles or None,
+            preset=args.preset,
+            columns=args.columns,
+            cell_key=args.cell_size,
+            style=args.style,
+            seed=args.seed,
+            margin=args.margin,
+            spacing=args.spacing,
+            transparent_bg=args.transparent,
+            slice_tiles=args.slice,
         )
     else:
         parser.error(f"Unknown command: {args.command}")
