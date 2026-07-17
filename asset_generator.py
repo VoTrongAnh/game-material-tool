@@ -110,6 +110,27 @@ TILE_PRESETS: dict[str, list[str]] = {
 }
 
 
+_CUSTOM_SIZE_RE = re.compile(r"^\s*(\d{1,5})\s*[xX]\s*(\d{1,5})\s*$")
+
+
+def resolve_size(value: str, allowed_keys: set[str], label: str) -> tuple[int, int]:
+    """Resolve a size argument that may be either a preset key (e.g. 'background_hd')
+    or a literal 'WIDTHxHEIGHT' string (e.g. '800x600', '1024x768')."""
+    match = _CUSTOM_SIZE_RE.match(value)
+    if match:
+        width, height = int(match.group(1)), int(match.group(2))
+        if width < 1 or height < 1:
+            raise ValueError(f"Invalid custom {label} size '{value}': width/height must be >= 1")
+        return (width, height)
+
+    if value not in allowed_keys:
+        raise ValueError(
+            f"Invalid {label} size '{value}'. Use one of {sorted(allowed_keys)}, "
+            f"or a custom size like '800x600'."
+        )
+    return ASSET_SIZES[value]
+
+
 @dataclass
 class FrameMetadata:
     index: int
@@ -601,8 +622,7 @@ class GameAssetStudio:
         seed: int = -1,
         filename: str | None = None,
     ) -> GeneratedAsset:
-        self._validate_size_key(size_key, BACKGROUND_SIZE_KEYS, "background")
-        width, height = ASSET_SIZES[size_key]
+        width, height = resolve_size(size_key, BACKGROUND_SIZE_KEYS, "background")
         prompt = PromptOptimizer.build_background_prompt(subject, style, time_of_day)
         result = self.gen.generate_with_metadata(
             prompt,
@@ -628,8 +648,7 @@ class GameAssetStudio:
         seed: int = -1,
         filename: str | None = None,
     ) -> GeneratedAsset:
-        self._validate_size_key(size_key, SPRITE_SIZE_KEYS, "sprite")
-        width, height = ASSET_SIZES[size_key]
+        width, height = resolve_size(size_key, SPRITE_SIZE_KEYS, "sprite")
         prompt = PromptOptimizer.build_sprite_prompt(subject, style, facing)
         result = self.gen.generate_with_metadata(
             prompt,
@@ -662,8 +681,7 @@ class GameAssetStudio:
         seed: int = -1,
         filename: str | None = None,
     ) -> GeneratedAsset:
-        self._validate_size_key(size_key, PIXEL_SIZE_KEYS, "pixel art")
-        width, height = ASSET_SIZES[size_key]
+        width, height = resolve_size(size_key, PIXEL_SIZE_KEYS, "pixel art")
         prompt = PromptOptimizer.build_pixel_art_prompt(subject)
         result = self.gen.generate_with_metadata(
             prompt,
@@ -691,8 +709,7 @@ class GameAssetStudio:
         filename: str | None = None,
     ) -> GeneratedAsset:
         """Deterministic local image-to-pixel pipeline for uploaded HD assets."""
-        self._validate_size_key(size_key, PIXEL_SIZE_KEYS, "pixel art")
-        width, height = ASSET_SIZES[size_key]
+        width, height = resolve_size(size_key, PIXEL_SIZE_KEYS, "pixel art")
         source = Path(image_path)
         img = Image.open(source).convert("RGBA")
         img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.NEAREST)
@@ -828,8 +845,7 @@ class GameAssetStudio:
         if columns < 1:
             raise ValueError("columns must be >= 1")
 
-        self._validate_size_key(cell_key, TILE_SIZE_KEYS, "tile")
-        cell_w, cell_h = ASSET_SIZES[cell_key]
+        cell_w, cell_h = resolve_size(cell_key, TILE_SIZE_KEYS, "tile")
 
         generated_tiles: list[Image.Image] = []
         warnings: list[str] = []

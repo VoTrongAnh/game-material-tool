@@ -24,10 +24,25 @@ from asset_generator import (
     TILE_PRESETS,
     TILE_SIZE_KEYS,
     GameAssetStudio,
+    resolve_size,
 )
 
 
 STYLE_CHOICES = ["pixel_art", "cartoon", "realistic", "chibi"]
+
+
+def size_type(allowed_keys, label):
+    """argparse type: accepts a preset key OR a custom 'WIDTHxHEIGHT' string
+    (e.g. '800x600'), validated up front so bad input fails before any API call."""
+
+    def _parse(value: str) -> str:
+        try:
+            resolve_size(value, allowed_keys, label)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+        return value
+
+    return _parse
 
 
 def print_asset(asset) -> None:
@@ -45,7 +60,12 @@ def main() -> None:
 
     p_bg = sub.add_parser("background", help="Generate a game background")
     p_bg.add_argument("subject", help="Scene description, e.g. 'forest with river'")
-    p_bg.add_argument("--size", default="background_hd", choices=sorted(BACKGROUND_SIZE_KEYS))
+    p_bg.add_argument(
+        "--size",
+        default="background_hd",
+        type=size_type(BACKGROUND_SIZE_KEYS, "background"),
+        help=f"Preset ({sorted(BACKGROUND_SIZE_KEYS)}) or custom 'WIDTHxHEIGHT', e.g. 800x600",
+    )
     p_bg.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
     p_bg.add_argument("--time", default="day", choices=["day", "night", "dusk", "dawn"])
     p_bg.add_argument("--seed", type=int, default=-1)
@@ -53,7 +73,12 @@ def main() -> None:
 
     p_sp = sub.add_parser("sprite", help="Generate a character/item sprite")
     p_sp.add_argument("subject", help="Sprite description, e.g. 'cute dragon'")
-    p_sp.add_argument("--size", default="sprite_medium", choices=sorted(SPRITE_SIZE_KEYS))
+    p_sp.add_argument(
+        "--size",
+        default="sprite_medium",
+        type=size_type(SPRITE_SIZE_KEYS, "sprite"),
+        help=f"Preset ({sorted(SPRITE_SIZE_KEYS)}) or custom 'WIDTHxHEIGHT', e.g. 96x96",
+    )
     p_sp.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
     p_sp.add_argument("--facing", default="front", choices=["front", "side", "back", "three-quarter"])
     p_sp.add_argument("--transparent", action="store_true")
@@ -62,7 +87,12 @@ def main() -> None:
 
     p_px = sub.add_parser("pixel", help="Generate a text-to-pixel-art asset")
     p_px.add_argument("subject", help="Description, e.g. 'wooden shield'")
-    p_px.add_argument("--size", default="sprite_medium", choices=sorted(PIXEL_SIZE_KEYS))
+    p_px.add_argument(
+        "--size",
+        default="sprite_medium",
+        type=size_type(PIXEL_SIZE_KEYS, "pixel art"),
+        help=f"Preset ({sorted(PIXEL_SIZE_KEYS)}) or custom 'WIDTHxHEIGHT', e.g. 100x100",
+    )
     p_px.add_argument("--block", type=int, default=8, help="Pixel block size, e.g. 4-16")
     p_px.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
     p_px.add_argument("--seed", type=int, default=-1)
@@ -70,7 +100,12 @@ def main() -> None:
 
     p_px_img = sub.add_parser("pixel-from-image", help="Convert an existing image to pixel art")
     p_px_img.add_argument("image_path", help="Input PNG/JPG/WebP path")
-    p_px_img.add_argument("--size", default="sprite_medium", choices=sorted(PIXEL_SIZE_KEYS))
+    p_px_img.add_argument(
+        "--size",
+        default="sprite_medium",
+        type=size_type(PIXEL_SIZE_KEYS, "pixel art"),
+        help=f"Preset ({sorted(PIXEL_SIZE_KEYS)}) or custom 'WIDTHxHEIGHT', e.g. 100x100",
+    )
     p_px_img.add_argument("--block", type=int, default=8, help="Pixel block size, e.g. 4-16")
     p_px_img.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
     p_px_img.add_argument("--out", default="output")
@@ -102,7 +137,13 @@ def main() -> None:
         help="Use a built-in tile list instead of typing subjects manually.",
     )
     p_tset.add_argument("--columns", type=int, default=8, help="Number of tiles per row")
-    p_tset.add_argument("--cell-size", dest="cell_size", default="tile_32", choices=sorted(TILE_SIZE_KEYS))
+    p_tset.add_argument(
+        "--cell-size",
+        dest="cell_size",
+        default="tile_32",
+        type=size_type(TILE_SIZE_KEYS, "tile"),
+        help=f"Preset ({sorted(TILE_SIZE_KEYS)}) or custom 'WIDTHxHEIGHT', e.g. 40x40",
+    )
     p_tset.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
     p_tset.add_argument("--margin", type=int, default=0, help="Border padding around the whole sheet, in px")
     p_tset.add_argument("--spacing", type=int, default=1, help="Gutter between tiles, in px")
