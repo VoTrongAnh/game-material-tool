@@ -10,15 +10,6 @@
 pip install -r requirements.txt
 ```
 
-## Cấu hình API Key (tuỳ chọn)
-
-Free tier không cần key nhưng có watermark và rate limit (1 req/15s).
-Đăng ký tại [enter.pollinations.ai](https://enter.pollinations.ai) để lấy key:
-
-```bash
-export POLLINATIONS_API_KEY=sk_your_key_here
-```
-
 ---
 
 ## Dùng CLI
@@ -41,6 +32,9 @@ python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 
 
 # Tileset tự chọn tile
 python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
+
+# Ảnh HD nhân vật -> sinh sprite pixel art mới
+python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "holding straw hat"
 ```
 
 ---

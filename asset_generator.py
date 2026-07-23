@@ -10,6 +10,7 @@ Scope:
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import math
@@ -27,8 +28,18 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt"
+POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
 API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
 OUTPUT_DIR = Path("output")
+
+DEFAULT_CHARACTER_CAPTION_INSTRUCTION = (
+    "Describe the main character in this image for use as an AI image generation "
+    "prompt. In one dense sentence (no intro, no markdown), cover: character name if "
+    "recognizable, species/body type, hairstyle and color, outfit and colors, key "
+    "accessories or props, facial expression, and any distinctive visual traits. "
+    "Only describe the character itself - ignore the background, art style, and "
+    "image quality."
+)
 
 
 ASSET_SIZES: dict[str, tuple[int, int]] = {
@@ -179,6 +190,22 @@ class ProviderResult:
     model: str
     seed: int
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CaptionResult:
+    description: str
+    provider: str
+    model: str
+    warnings: list[str] = field(default_factory=list)
+
+
+class ImageCaptioner(Protocol):
+    name: str
+    model: str
+
+    def describe(self, image: Image.Image, *, instruction: str) -> CaptionResult:
+        ...
 
 
 class AIImageProvider(Protocol):
@@ -369,6 +396,80 @@ class PollinationsProvider:
                     time.sleep(2 * attempt)
 
         raise RuntimeError(f"Cannot generate image after {self.retries} attempts: {last_error}") from last_error
+
+
+class PollinationsCaptioner:
+    """Vision-capable text provider (Pollinations' OpenAI-compatible chat endpoint).
+    Turns a reference image into a reusable text description that can be fed back
+    into PromptOptimizer/PollinationsProvider to (re)generate a game-ready asset."""
+
+    name = "pollinations"
+
+    def __init__(
+        self,
+        api_key: str = API_KEY,
+        model: str = "openai",
+        base_url: str = POLLINATIONS_TEXT_URL,
+        timeout: int = 60,
+        retries: int = 3,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.retries = retries
+
+    @staticmethod
+    def _to_data_uri(image: Image.Image) -> str:
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="JPEG", quality=92)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    def describe(self, image: Image.Image, *, instruction: str) -> CaptionResult:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {"type": "image_url", "image_url": {"url": self._to_data_uri(image)}},
+                    ],
+                }
+            ],
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        last_error: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = requests.post(self.base_url, json=payload, headers=headers, timeout=self.timeout)
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    # Some OpenAI-compatible backends return content as a list of parts.
+                    content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+                content = (content or "").strip()
+                if not content:
+                    raise RuntimeError("Vision provider returned an empty caption")
+                return CaptionResult(description=content, provider=self.name, model=self.model)
+            except (requests.RequestException, KeyError, IndexError, ValueError, RuntimeError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(2 * attempt)
+
+        # Fail soft: caller falls back to filename-derived subject instead of crashing
+        # the whole pipeline just because captioning is unavailable.
+        return CaptionResult(
+            description="",
+            provider=self.name,
+            model=self.model,
+            warnings=[f"Image captioning failed after {self.retries} attempts: {last_error}"],
+        )
 
 
 class ImageGenerator:
@@ -607,9 +708,11 @@ class GameAssetStudio:
         model: str = "flux",
         output_dir: str | Path = OUTPUT_DIR,
         provider: AIImageProvider | None = None,
+        captioner: ImageCaptioner | None = None,
     ):
         self.gen = ImageGenerator(api_key=api_key, model=model, provider=provider)
         self.proc = AssetPostProcessor()
+        self.captioner = captioner or PollinationsCaptioner(api_key=api_key)
         self.out = Path(output_dir)
         self.out.mkdir(parents=True, exist_ok=True)
 
@@ -727,6 +830,69 @@ class GameAssetStudio:
             seed=-1,
         )
         return self._asset_metadata("pixel_art", f"convert image to pixel art: {source.name}", result, img, path)
+
+    def describe_reference_image(
+        self,
+        image_path: str | Path,
+        instruction: str | None = None,
+    ) -> CaptionResult:
+        """Caption an uploaded HD image (e.g. a Luffy render) into a dense text
+        description usable as a generation subject/prompt."""
+        source = Path(image_path)
+        if not source.exists():
+            raise FileNotFoundError(f"Reference image not found: {source}")
+        img = Image.open(source).convert("RGB")
+        return self.captioner.describe(img, instruction=instruction or DEFAULT_CHARACTER_CAPTION_INSTRUCTION)
+
+    def generate_sprite_from_image(
+        self,
+        image_path: str | Path,
+        size_key: str = "sprite_medium",
+        style: str = "pixel_art",
+        facing: str = "front",
+        transparent_bg: bool = True,
+        seed: int = -1,
+        filename: str | None = None,
+        extra_details: str | None = None,
+        instruction: str | None = None,
+    ) -> GeneratedAsset:
+        """Reference-image -> prompt -> sprite pipeline.
+
+        Upload an HD image of a character (e.g. Luffy) and this will:
+          1. Auto-caption the character via a vision model (name/outfit/colors/props).
+          2. Feed that description into the normal sprite prompt builder.
+          3. Generate a brand-new, clean pixel-art sprite of that character, ready to
+             drop straight into GameMaker (transparent bg, isolated, single pose).
+
+        This is different from `convert_image_to_pixel_art`, which only downsamples
+        the pixels of the original image locally; this method regenerates the
+        character from scratch through the image model, so it can fix pose/background/
+        style regardless of what the source photo/render looked like.
+        """
+        source = Path(image_path)
+        caption = self.describe_reference_image(source, instruction=instruction)
+
+        subject = caption.description or source.stem.replace("_", " ").replace("-", " ")
+        if extra_details:
+            subject = f"{subject}, {extra_details}"
+
+        asset = self.generate_sprite(
+            subject=subject,
+            size_key=size_key,
+            style=style,
+            facing=facing,
+            transparent_bg=transparent_bg,
+            seed=seed,
+            filename=filename or f"sprite_from_{source.stem}_{size_key}",
+        )
+
+        asset.prompt = (
+            f"[reference image: {source.name}] auto-caption: {caption.description!r} "
+            f"-> sprite prompt: {asset.prompt}"
+        )
+        if caption.warnings:
+            asset.warnings = caption.warnings + asset.warnings
+        return asset
 
     def generate_tilesheet(
         self,

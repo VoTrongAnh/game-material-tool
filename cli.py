@@ -6,6 +6,7 @@ Examples:
   python cli.py sprite "knight warrior" --size sprite_medium --transparent
   python cli.py pixel "gold coin" --size sprite_small --block 4
   python cli.py pixel-from-image "./input.png" --size sprite_small --block 4
+  python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "holding a sword"
   python cli.py tilesheet "walking cat" --frames 10 --frame-width 64 --frame-height 64 --slice
   python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 --slice
   python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
@@ -110,6 +111,29 @@ def main() -> None:
     p_px_img.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
     p_px_img.add_argument("--out", default="output")
 
+    p_sp_img = sub.add_parser(
+        "sprite-from-image",
+        help="Auto-describe a reference image (e.g. an HD Luffy render) then generate a brand-new pixel-art sprite of that character",
+    )
+    p_sp_img.add_argument("image_path", help="Input HD PNG/JPG/WebP reference image, e.g. './luffy_hd.png'")
+    p_sp_img.add_argument(
+        "--size",
+        default="sprite_medium",
+        type=size_type(SPRITE_SIZE_KEYS, "sprite"),
+        help=f"Preset ({sorted(SPRITE_SIZE_KEYS)}) or custom 'WIDTHxHEIGHT', e.g. 96x96",
+    )
+    p_sp_img.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_sp_img.add_argument("--facing", default="front", choices=["front", "side", "back", "three-quarter"])
+    p_sp_img.add_argument("--no-transparent", dest="transparent", action="store_false", default=True)
+    p_sp_img.add_argument(
+        "--extra",
+        dest="extra_details",
+        default=None,
+        help="Extra detail to append to the auto-generated character description, e.g. 'holding a sword'",
+    )
+    p_sp_img.add_argument("--seed", type=int, default=-1)
+    p_sp_img.add_argument("--out", default="output")
+
     p_ts = sub.add_parser("tilesheet", help="Generate a horizontal sprite animation sheet")
     p_ts.add_argument("subject", help="Character/animation description, e.g. 'running warrior'")
     p_ts.add_argument("--frames", type=int, default=10)
@@ -190,6 +214,16 @@ def main() -> None:
             size_key=args.size,
             block_size=args.block,
             colors=args.colors,
+        )
+    elif args.command == "sprite-from-image":
+        asset = studio.generate_sprite_from_image(
+            image_path=args.image_path,
+            size_key=args.size,
+            style=args.style,
+            facing=args.facing,
+            transparent_bg=args.transparent,
+            extra_details=args.extra_details,
+            seed=args.seed,
         )
     elif args.command == "tilesheet":
         asset = studio.generate_tilesheet(
