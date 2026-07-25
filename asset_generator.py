@@ -28,7 +28,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt"
-POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
+POLLINATIONS_TEXT_URL = "https://gen.pollinations.ai/v1/chat/completions"
 API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
 OUTPUT_DIR = Path("output")
 
@@ -447,6 +447,15 @@ class PollinationsCaptioner:
         for attempt in range(1, self.retries + 1):
             try:
                 response = requests.post(self.base_url, json=payload, headers=headers, timeout=self.timeout)
+                if response.status_code == 402:
+                    last_error = RuntimeError(
+                        "Pollinations returned 402 Payment Required: the API key has no Pollen "
+                        "balance for a vision-capable text model. Get a key at "
+                        "https://enter.pollinations.ai and set POLLINATIONS_API_KEY=sk_... "
+                        "(free tiers still get a small daily Pollen grant; anonymous/no-key "
+                        "requests do not)."
+                    )
+                    break  # config issue, retrying won't help
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]

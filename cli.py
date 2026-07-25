@@ -18,6 +18,14 @@ import argparse
 import json
 import os
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # đọc file .env trong thư mục hiện tại trước khi import asset_generator,
+    # vì asset_generator đọc os.getenv("POLLINATIONS_API_KEY") ngay lúc import module
+except ImportError:
+    pass  # chưa cài python-dotenv -> vẫn dùng biến môi trường set tay như bình thường
+
 from asset_generator import (
     BACKGROUND_SIZE_KEYS,
     PIXEL_SIZE_KEYS,

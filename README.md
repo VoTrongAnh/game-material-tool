@@ -10,6 +10,13 @@
 pip install -r requirements.txt
 ```
 
+## Cấu hình API Key
+
+```
+POLLINATIONS_API_KEY=sk_your_key_here
+```
+
+Lấy key tại [enter.pollinations.ai](https://enter.pollinations.ai).
 ---
 
 ## Dùng CLI
@@ -24,6 +31,12 @@ python cli.py sprite "knight warrior" --transparent --size sprite_medium
 # Pixel art
 python cli.py pixel "wooden shield" --block 4 --colors 16
 
+# Convert ảnh có sẵn thành pixel art (xử lý local, không gọi AI sinh lại)
+python cli.py pixel-from-image "./input.png" --size sprite_small --block 4
+
+# Ảnh HD nhân vật -> tự mô tả -> sinh sprite pixel art mới (dùng AI, cần API key)
+python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "holding straw hat"
+
 # Tilesheet (animation frames) + cắt frame lẻ
 python cli.py tilesheet "running robot" --frames 10 --slice
 
@@ -32,9 +45,46 @@ python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 
 
 # Tileset tự chọn tile
 python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
+```
 
-# Ảnh HD nhân vật -> sinh sprite pixel art mới
-python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "holding straw hat"
+---
+
+## Ảnh HD → Sprite pixel art (mới)
+
+`sprite-from-image` giải quyết bài toán: có 1 tấm ảnh HD (ví dụ nhân vật Luffy) và muốn ra ngay 1 sprite pixel art của nhân vật đó để bỏ vào GameMaker.
+
+Pipeline gồm 3 bước, chạy tự động:
+
+1. **Caption** — gửi ảnh cho model vision (`openai`, GPT-5 Nano trên Pollinations) để mô tả nhân vật: tên (nếu nhận diện được), trang phục, màu sắc, phụ kiện, đặc điểm nổi bật.
+2. **Build prompt** — ghép mô tả đó (+ `--extra` nếu có) vào prompt sprite chuẩn của studio (front-facing, isolated, transparent background, pixel art 8-bit...).
+3. **Generate** — gọi lại model ảnh (`flux`) để **sinh sprite hoàn toàn mới**, không phải downsize ảnh gốc.
+
+```bash
+python cli.py sprite-from-image "./luffy_hd.png" \
+  --size sprite_medium \
+  --facing front \
+  --extra "holding straw hat"
+```
+
+| Tham số | Ý nghĩa |
+|---|---|
+| `image_path` (positional) | Ảnh HD đầu vào (PNG/JPG/WebP) |
+| `--size` | Preset (`sprite_small` / `sprite_medium` / `sprite_large`...) hoặc `WIDTHxHEIGHT` tuỳ ý |
+| `--style` | `pixel_art` (mặc định) / `cartoon` / `realistic` / `chibi` |
+| `--facing` | `front` / `side` / `back` / `three-quarter` |
+| `--no-transparent` | Giữ nền thay vì xoá nền (mặc định có xoá nền) |
+| `--extra` | Thêm chi tiết vào mô tả tự sinh, ví dụ phụ kiện/pose muốn ép thêm |
+| `--seed` | Seed cố định để tái tạo lại kết quả |
+
+**Khác với `pixel-from-image`:** lệnh cũ chỉ xử lý pixel cục bộ trên chính ảnh gốc (downsample + giảm palette), phụ thuộc hoàn toàn vào pose/nền/chất lượng ảnh gốc. `sprite-from-image` sinh **ảnh mới hoàn toàn** qua model, nên sprite ra sạch pose, nền trong suốt, đúng chuẩn game-ready bất kể ảnh gốc trông thế nào — đổi lại cần API key (xem mục Cấu hình API Key ở trên).
+
+JSON trả về có thêm field ghi lại cả caption gốc lẫn prompt cuối để debug:
+
+```json
+{
+  "prompt": "[reference image: luffy_hd.png] auto-caption: 'Monkey D. Luffy, straw hat pirate...' -> sprite prompt: ...",
+  "warnings": []
+}
 ```
 
 ---
@@ -58,10 +108,11 @@ python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "h
 | `tile_64`       | 64×64 | Tile chi tiết cao |
 
 > Kích thước từng frame trong `tilesheet` do bạn tự đặt qua `--frame-width` / `--frame-height` (mặc định 64×64), không phải một size cố định.
+> Mọi lệnh nhận `--size`/`--cell-size` đều chấp nhận preset key ở trên **hoặc** chuỗi tuỳ ý dạng `WIDTHxHEIGHT` (ví dụ `800x600`).
 
 ---
 
-## Tileset (mới)
+## Tileset
 
 Sinh ra một **sheet dạng lưới** gồm nhiều tile riêng biệt (cỏ, nước, dung nham, cây, rương, đuốc...), mỗi tile một ô kích thước cố định, nền trong suốt — import thẳng vào GameMaker's "Create Tile Set" hoặc Tiled.
 
@@ -75,7 +126,7 @@ Các tuỳ chọn chính:
 |---|---|
 | `tiles` (positional) | Danh sách mô tả từng tile, mỗi mô tả = 1 ô lưới |
 | `--preset` | Dùng bộ tile dựng sẵn thay vì tự liệt kê: `platformer_basic`, `dungeon`, `cave` |
-| `--cell-size` | Kích thước mỗi ô: `tile_16` / `tile_24` / `tile_32` / `tile_48` / `tile_64` |
+| `--cell-size` | Kích thước mỗi ô: `tile_16` / `tile_24` / `tile_32` / `tile_48` / `tile_64` hoặc `WIDTHxHEIGHT` |
 | `--columns` | Số tile mỗi hàng (số hàng tự tính theo tổng số tile) |
 | `--margin` | Viền quanh toàn bộ sheet (px) |
 | `--spacing` | Khoảng cách giữa các tile (px), tránh GameMaker đọc lem tile khi lấy mẫu |
@@ -92,6 +143,7 @@ Mỗi lần chạy sinh ra thêm file `<tên>.json` bên cạnh ảnh PNG, mô t
 output/
 ├── backgrounds/
 ├── sprites/
+│   └── sprite_from_luffy_hd_sprite_medium.png   ← từ sprite-from-image
 ├── pixel_art/
 ├── tilesheets/
 │   └── tilesheet_walking_cat_10f/   ← frames lẻ (nếu --slice)

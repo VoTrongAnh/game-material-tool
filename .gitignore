@@ -1,17 +1,11 @@
-# Python cache
+# Secrets - never commit
+.env
+
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 
 # Generated assets
 output/
-
-# Virtual env
-venv/
-.env
-
-# VSCode
-.vscode/
-
-# OS files
-.DS_Store
-Thumbs.db
