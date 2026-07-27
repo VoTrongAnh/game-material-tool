@@ -46,7 +46,40 @@ python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 
 # Tileset tự chọn tile
 python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
 ```
+### `GeneratedAsset.to_web_payload()`
 
+Chuẩn hóa output của mọi asset về cùng một JSON format để frontend sử dụng trực tiếp:
+
+```json
+{
+  "image": "data:image/png;base64,...",
+  "metadata": {
+    "total_frames": 8,
+    "layout_format": "horizontal",
+    "frame_width": 64,
+    "frame_height": 64,
+    "columns": 8,
+    "rows": 1
+  }
+}
+```
+
+Hỗ trợ:
+- `sprite-from-image` → `layout_format: "single"`
+- `tilesheet` → `layout_format: "horizontal"`
+- `tileset` → `layout_format: "grid"`
+
+### `--web-json`
+
+Thêm cho các lệnh:
+
+```bash
+python cli.py sprite-from-image "./luffy_hd.png" --web-json
+python cli.py tilesheet "running warrior" --frames 8 --web-json
+python cli.py tileset --preset platformer_basic --web-json
+```
+
+Xuất trực tiếp JSON (Base64 + metadata), giúp frontend không cần đọc file PNG từ đĩa.
 ---
 
 ## Ảnh HD → Sprite pixel art (mới)

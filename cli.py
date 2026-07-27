@@ -59,6 +59,12 @@ def print_asset(asset) -> None:
     print(json.dumps(asset.to_dict(), ensure_ascii=False, indent=2))
 
 
+def print_web_payload(asset) -> None:
+    """Print {'image': base64 data URI, 'metadata': {...}} for a web frontend to
+    consume directly - no file path, no filesystem access needed on their side."""
+    print(json.dumps(asset.to_web_payload(), ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="game-asset",
@@ -141,6 +147,12 @@ def main() -> None:
     )
     p_sp_img.add_argument("--seed", type=int, default=-1)
     p_sp_img.add_argument("--out", default="output")
+    p_sp_img.add_argument(
+        "--web-json",
+        action="store_true",
+        help="Print {'image': base64 data URI, 'metadata': {...}} instead of the normal "
+        "asset JSON, ready for a web frontend to preview/slice without filesystem access.",
+    )
 
     p_ts = sub.add_parser("tilesheet", help="Generate a horizontal sprite animation sheet")
     p_ts.add_argument("subject", help="Character/animation description, e.g. 'running warrior'")
@@ -152,6 +164,12 @@ def main() -> None:
     p_ts.add_argument("--seed", type=int, default=-1)
     p_ts.add_argument("--slice", action="store_true", help="Also save each frame separately")
     p_ts.add_argument("--out", default="output")
+    p_ts.add_argument(
+        "--web-json",
+        action="store_true",
+        help="Print {'image': base64 data URI, 'metadata': {...}} instead of the normal "
+        "asset JSON, ready for a web frontend to preview/slice without filesystem access.",
+    )
 
     p_tset = sub.add_parser(
         "tileset",
@@ -183,6 +201,12 @@ def main() -> None:
     p_tset.add_argument("--slice", action="store_true", help="Also save each tile as its own PNG")
     p_tset.add_argument("--seed", type=int, default=-1)
     p_tset.add_argument("--out", default="output")
+    p_tset.add_argument(
+        "--web-json",
+        action="store_true",
+        help="Print {'image': base64 data URI, 'metadata': {...}} instead of the normal "
+        "asset JSON, ready for a web frontend to preview/slice without filesystem access.",
+    )
 
     args = parser.parse_args()
     studio = GameAssetStudio(
@@ -262,7 +286,10 @@ def main() -> None:
         parser.error(f"Unknown command: {args.command}")
         return
 
-    print_asset(asset)
+    if getattr(args, "web_json", False):
+        print_web_payload(asset)
+    else:
+        print_asset(asset)
 
 
 if __name__ == "__main__":

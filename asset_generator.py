@@ -15,6 +15,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import time
 import uuid
@@ -175,6 +176,51 @@ class GeneratedAsset:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def to_web_payload(self) -> dict[str, Any]:
+        """Return {'image': <base64 data URI>, 'metadata': {...}} so a web/frontend
+        team can slice frames and render a preview directly from one JSON response,
+        without needing filesystem access to `file_path`.
+
+        Works for a single static sprite (1 frame, layout 'single'), a multi-frame
+        horizontal sheet like `generate_tilesheet` (layout 'horizontal'), and a
+        multi-row grid like `generate_tileset` (layout 'grid').
+        """
+        mime = f"image/{self.format.lower()}" if self.format else "image/png"
+        image_bytes = self.path.read_bytes()
+        data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+        if self.frames:
+            total_frames = len(self.frames)
+            frame_width = self.frames[0].w
+            frame_height = self.frames[0].h
+            # Derive the real grid shape from each frame's (x, y) instead of assuming
+            # a single row, so this also works for grid layouts like generate_tileset
+            # (multiple rows), not just the always-1-row generate_tilesheet output.
+            distinct_rows = sorted({f.y for f in self.frames})
+            distinct_cols = sorted({f.x for f in self.frames})
+            rows = len(distinct_rows)
+            columns = len(distinct_cols) if rows <= 1 else math.ceil(total_frames / rows)
+            layout_format = "horizontal" if rows <= 1 else "grid"
+        else:
+            total_frames = 1
+            frame_width = self.width
+            frame_height = self.height
+            layout_format = "single"
+            columns = 1
+            rows = 1
+
+        return {
+            "image": data_uri,
+            "metadata": {
+                "total_frames": total_frames,
+                "layout_format": layout_format,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+                "columns": columns,
+                "rows": rows,
+            },
+        }
 
     def __fspath__(self) -> str:
         return self.file_path
@@ -924,10 +970,14 @@ class GameAssetStudio:
         warnings: list[str] = []
         provider_name = ""
         model = ""
-        used_seed = seed
+        # Pick ONE base seed for the whole sheet (once, before the loop) so every frame
+        # shares the same visual identity. Each frame then only offsets by +index from
+        # that base -> consistent character/style across frames.
+        base_seed = seed if seed >= 0 else random.randint(0, 2_147_483_647 - frames)
+        used_seed = base_seed
 
         for index in range(frames):
-            frame_seed = seed + index if seed >= 0 else -1
+            frame_seed = base_seed + index
             prompt = PromptOptimizer.build_animation_frame_prompt(subject, action, index, frames, style)
             result = self.gen.generate_with_metadata(
                 prompt,
@@ -938,8 +988,6 @@ class GameAssetStudio:
             )
             provider_name = result.provider
             model = result.model
-            if index == 0:
-                used_seed = result.seed
             warnings.extend(result.warnings)
 
             frame = self.proc.remove_background(result.image)
