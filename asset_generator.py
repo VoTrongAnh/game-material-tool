@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -26,6 +27,10 @@ from PIL import Image, ImageChops, ImageFilter, ImageOps, UnidentifiedImageError
 
 
 POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt"
+<<<<<<< Updated upstream
+=======
+POLLINATIONS_TEXT_URL = "https://gen.pollinations.ai/v1/chat/completions"
+>>>>>>> Stashed changes
 API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
 OUTPUT_DIR = Path("output")
 
@@ -140,6 +145,51 @@ class GeneratedAsset:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def to_web_payload(self) -> dict[str, Any]:
+        """Return {'image': <base64 data URI>, 'metadata': {...}} so a web/frontend
+        team can slice frames and render a preview directly from one JSON response,
+        without needing filesystem access to `file_path`.
+
+        Works for a single static sprite (1 frame, layout 'single'), a multi-frame
+        horizontal sheet like `generate_tilesheet` (layout 'horizontal'), and a
+        multi-row grid like `generate_tileset` (layout 'grid').
+        """
+        mime = f"image/{self.format.lower()}" if self.format else "image/png"
+        image_bytes = self.path.read_bytes()
+        data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+        if self.frames:
+            total_frames = len(self.frames)
+            frame_width = self.frames[0].w
+            frame_height = self.frames[0].h
+            # Derive the real grid shape from each frame's (x, y) instead of assuming
+            # a single row, so this also works for grid layouts like generate_tileset
+            # (multiple rows), not just the always-1-row generate_tilesheet output.
+            distinct_rows = sorted({f.y for f in self.frames})
+            distinct_cols = sorted({f.x for f in self.frames})
+            rows = len(distinct_rows)
+            columns = len(distinct_cols) if rows <= 1 else math.ceil(total_frames / rows)
+            layout_format = "horizontal" if rows <= 1 else "grid"
+        else:
+            total_frames = 1
+            frame_width = self.width
+            frame_height = self.height
+            layout_format = "single"
+            columns = 1
+            rows = 1
+
+        return {
+            "image": data_uri,
+            "metadata": {
+                "total_frames": total_frames,
+                "layout_format": layout_format,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+                "columns": columns,
+                "rows": rows,
+            },
+        }
 
     def __fspath__(self) -> str:
         return self.file_path
@@ -495,6 +545,92 @@ class PollinationsProvider:
         raise RuntimeError(f"Cannot generate image after {self.retries} attempts: {last_error}") from last_error
 
 
+<<<<<<< Updated upstream
+=======
+class PollinationsCaptioner:
+    """Vision-capable text provider (Pollinations' OpenAI-compatible chat endpoint).
+    Turns a reference image into a reusable text description that can be fed back
+    into PromptOptimizer/PollinationsProvider to (re)generate a game-ready asset."""
+
+    name = "pollinations"
+
+    def __init__(
+        self,
+        api_key: str = API_KEY,
+        model: str = "openai",
+        base_url: str = POLLINATIONS_TEXT_URL,
+        timeout: int = 60,
+        retries: int = 3,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.retries = retries
+
+    @staticmethod
+    def _to_data_uri(image: Image.Image) -> str:
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="JPEG", quality=92)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    def describe(self, image: Image.Image, *, instruction: str) -> CaptionResult:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {"type": "image_url", "image_url": {"url": self._to_data_uri(image)}},
+                    ],
+                }
+            ],
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        last_error: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = requests.post(self.base_url, json=payload, headers=headers, timeout=self.timeout)
+                if response.status_code == 402:
+                    last_error = RuntimeError(
+                        "Pollinations returned 402 Payment Required: the API key has no Pollen "
+                        "balance for a vision-capable text model. Get a key at "
+                        "https://enter.pollinations.ai and set POLLINATIONS_API_KEY=sk_... "
+                        "(free tiers still get a small daily Pollen grant; anonymous/no-key "
+                        "requests do not)."
+                    )
+                    break  # config issue, retrying won't help
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    # Some OpenAI-compatible backends return content as a list of parts.
+                    content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+                content = (content or "").strip()
+                if not content:
+                    raise RuntimeError("Vision provider returned an empty caption")
+                return CaptionResult(description=content, provider=self.name, model=self.model)
+            except (requests.RequestException, KeyError, IndexError, ValueError, RuntimeError) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(2 * attempt)
+
+        # Fail soft: caller falls back to filename-derived subject instead of crashing
+        # the whole pipeline just because captioning is unavailable.
+        return CaptionResult(
+            description="",
+            provider=self.name,
+            model=self.model,
+            warnings=[f"Image captioning failed after {self.retries} attempts: {last_error}"],
+        )
+
+
+>>>>>>> Stashed changes
 class ImageGenerator:
     """Backward-compatible wrapper around the selected provider."""
 
@@ -1326,12 +1462,24 @@ class GameAssetStudio:
         used_seed = seed
         provider_name = ""
         model = ""
+<<<<<<< Updated upstream
 
         for idx, tile_name in enumerate(tiles):
             # Build prompt for this tile
             prompt = PromptOptimizer.build_tile_prompt(subject, tile_name, style)
             # Use a higher resolution for generation to preserve details, then downscale
             gen_size = max(tile_size[0] * 2, 256), max(tile_size[1] * 2, 256)
+=======
+        # Pick ONE base seed for the whole sheet (once, before the loop) so every frame
+        # shares the same visual identity. Each frame then only offsets by +index from
+        # that base -> consistent character/style across frames.
+        base_seed = seed if seed >= 0 else random.randint(0, 2_147_483_647 - frames)
+        used_seed = base_seed
+
+        for index in range(frames):
+            frame_seed = base_seed + index
+            prompt = PromptOptimizer.build_animation_frame_prompt(subject, action, index, frames, style)
+>>>>>>> Stashed changes
             result = self.gen.generate_with_metadata(
                 prompt,
                 width=gen_size[0],
@@ -1339,10 +1487,15 @@ class GameAssetStudio:
                 seed=seed if seed >= 0 else -1,
                 negative_prompt=PromptOptimizer.get_negative_prompt("tile"),
             )
+<<<<<<< Updated upstream
             if idx == 0:
                 used_seed = result.seed
                 provider_name = result.provider
                 model = result.model
+=======
+            provider_name = result.provider
+            model = result.model
+>>>>>>> Stashed changes
             warnings.extend(result.warnings)
 
             img = result.image.convert("RGBA")

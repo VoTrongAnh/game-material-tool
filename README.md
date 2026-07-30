@@ -16,6 +16,7 @@ Phần này tập trung vào AI pipeline và xử lý ảnh; phần giao diện 
 pip install -r requirements.txt
 ```
 
+<<<<<<< Updated upstream
 ## Chạy full pipeline / testing phase
 
 Để kiểm tra toàn bộ yêu cầu bằng một lệnh, dùng:
@@ -158,6 +159,11 @@ subject + style + time_of_day + theme + view_angle
 ```
 
 Ví dụ:
+=======
+---
+
+## Dùng CLI
+>>>>>>> Stashed changes
 
 ```bash
 python cli.py background "dark dungeon cave" --size background_sd --style pixel_art --theme fantasy --view-angle side_scroll
@@ -186,6 +192,7 @@ python cli.py sprite "knight warrior" --transparent --size sprite_medium --view-
 
 ### 3. Prop/item pipeline
 
+<<<<<<< Updated upstream
 ```txt
 subject + item_type + style + view_angle
 → tạo prompt prop/item
@@ -286,54 +293,33 @@ Ví dụ:
 
 ```bash
 python cli.py animation "running robot" --frames 10 --frame-width 64 --frame-height 64 --slice
+=======
+# Convert ảnh có sẵn thành pixel art (xử lý local, không gọi AI sinh lại)
+python cli.py pixel-from-image "./input.png" --size sprite_small --block 4
+
+# Ảnh HD nhân vật -> tự mô tả -> sinh sprite pixel art mới (dùng AI, cần API key)
+python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "holding straw hat"
+
+# Tilesheet + cắt frame lẻ
+python cli.py tilesheet "running robot" --frames 10 --slice
+
+# Tileset (lưới các tile rời cho GameMaker/Tiled), dùng bộ preset dựng sẵn
+python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 --slice
+
+# Tileset tự chọn tile
+python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
+
+# Ảnh HD nhân vật -> sinh sprite pixel art mới
+python cli.py sprite-from-image "./luffy_hd.png" --size sprite_medium --extra "holding straw hat"
+>>>>>>> Stashed changes
 ```
 
-Với 10 frame, mỗi frame 64x64, output sheet sẽ có kích thước:
-
-```txt
-640x64
-```
-
-## Metadata trả về
-
-Các hàm trong `GameAssetStudio` trả về object `GeneratedAsset`, không chỉ trả đường dẫn file.
-
-Thông tin chính gồm:
-
-```json
-{
-  "asset_id": "uuid",
-  "asset_type": "sprite",
-  "prompt": "...",
-  "provider": "pollinations",
-  "model": "flux",
-  "seed": 123,
-  "width": 128,
-  "height": 128,
-  "format": "png",
-  "file_path": "output/sprites/example.png",
-  "has_alpha": true,
-  "frames": [],
-  "warnings": []
-}
-```
-
-Với sprite sheet, `frames` sẽ chứa vị trí từng frame:
-
-```json
-{
-  "index": 0,
-  "x": 0,
-  "y": 0,
-  "w": 64,
-  "h": 64,
-  "file_path": "output/tilesheets/example/frame_00.png"
-}
-```
+---
 
 ## Kích thước chuẩn
 
 | Key | Kích thước | Dùng cho |
+<<<<<<< Updated upstream
 | --- | --- | --- |
 | `background_hd` | 1920x1080 | Background Full HD |
 | `background_4k` | 3840x2160 | Background 4K |
@@ -344,6 +330,49 @@ Với sprite sheet, `frames` sẽ chứa vị trí từng frame:
 | `sprite_medium` | 128x128 | Nhân vật chính |
 | `sprite_large` | 256x256 | Boss/NPC lớn |
 | `icon` | 32x32 | Icon |
+=======
+|-----|-----------|----------|
+| `background_hd` | 1920×1080 | GameMaker full HD |
+| `background_sd` | 1280×720 | Scratch Stage |
+| `background_sq` | 1080×1080 | Scratch vuông |
+| `sprite_small`  | 64×64 | Icon, item nhỏ |
+| `sprite_medium` | 128×128 | Nhân vật chính |
+| `sprite_large`  | 256×256 | Boss, NPC lớn |
+| `tile_16`       | 16×16 | Tile nhỏ, retro NES |
+| `tile_24`       | 24×24 | Tile trung |
+| `tile_32`       | 32×32 | Tile chuẩn phổ biến (GameMaker) |
+| `tile_48`       | 48×48 | Tile chi tiết vừa |
+| `tile_64`       | 64×64 | Tile chi tiết cao |
+
+> Kích thước từng frame trong `tilesheet` do bạn tự đặt qua `--frame-width` / `--frame-height` (mặc định 64×64), không phải một size cố định.
+
+---
+
+## Tileset (mới)
+
+Sinh ra một **sheet dạng lưới** gồm nhiều tile riêng biệt (cỏ, nước, dung nham, cây, rương, đuốc...), mỗi tile một ô kích thước cố định, nền trong suốt — import thẳng vào GameMaker's "Create Tile Set" hoặc Tiled.
+
+```bash
+python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 --spacing 2 --slice
+```
+
+Các tuỳ chọn chính:
+
+| Tham số | Ý nghĩa |
+|---|---|
+| `tiles` (positional) | Danh sách mô tả từng tile, mỗi mô tả = 1 ô lưới |
+| `--preset` | Dùng bộ tile dựng sẵn thay vì tự liệt kê: `platformer_basic`, `dungeon`, `cave` |
+| `--cell-size` | Kích thước mỗi ô: `tile_16` / `tile_24` / `tile_32` / `tile_48` / `tile_64` |
+| `--columns` | Số tile mỗi hàng (số hàng tự tính theo tổng số tile) |
+| `--margin` | Viền quanh toàn bộ sheet (px) |
+| `--spacing` | Khoảng cách giữa các tile (px), tránh GameMaker đọc lem tile khi lấy mẫu |
+| `--slice` | Lưu thêm từng tile thành file PNG riêng |
+| `--no-transparent` | Giữ nguyên nền thay vì xoá nền |
+
+Mỗi lần chạy sinh ra thêm file `<tên>.json` bên cạnh ảnh PNG, mô tả `tile_width`, `tile_height`, `columns`, `rows`, `margin`, `spacing` và tên/toạ độ (`x`, `y`, `index`) của từng tile — dùng để nhập tự động vào GameMaker/Tiled thay vì canh tay từng ô.
+
+---
+>>>>>>> Stashed changes
 
 ## Cấu trúc output
 
@@ -351,7 +380,11 @@ Với sprite sheet, `frames` sẽ chứa vị trí từng frame:
 output/
 ├── backgrounds/
 ├── sprites/
+<<<<<<< Updated upstream
 ├── props/
+=======
+│   └── sprite_from_luffy_hd_sprite_medium.png   ← từ sprite-from-image
+>>>>>>> Stashed changes
 ├── pixel_art/
 ├── tile_sheets/
 │   └── tilesheet_forest_terrain_8tiles/
