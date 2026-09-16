@@ -1,0 +1,8 @@
+{
+  "base_id": "base_tall_slim",
+  "hair_id": "hair_short_black",
+  "outfit_id": "outfit_knight_armor",
+  "shoes_id": "shoes_boots_brown",
+  "accessory_id": "accessory_sword",
+  "action": "action_idle"
+}

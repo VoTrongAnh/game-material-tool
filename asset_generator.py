@@ -28,7 +28,7 @@ import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 
-POLLINATIONS_BASE_URL = "https://image.pollinations.ai/prompt"
+POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/image"
 POLLINATIONS_TEXT_URL = "https://gen.pollinations.ai/v1/chat/completions"
 API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
 OUTPUT_DIR = Path("output")
@@ -122,7 +122,246 @@ TILE_PRESETS: dict[str, list[str]] = {
 }
 
 
+# --------------------------------------------------------------------------
+# Character Customizer catalog
+#
+# The Web team's Character Customizer ships a "Form Output" per generation
+# request: a small set of part IDs (base/hair/outfit/shoes/accessory/
+# expression) plus an action. AI owns turning those IDs into a prompt that
+# reliably produces a game-ready asset — this catalog is that mapping, kept
+# in one place so new options are a one-line addition, not a prompt rewrite.
+# Every *_id below must exist in its catalog; `CharacterFormOutput.validate()`
+# enforces that up front instead of silently mis-generating.
+# --------------------------------------------------------------------------
+
+CHARACTER_BASE_CATALOG: dict[str, str] = {
+    "base_tall_slim": "tall slender human build, long limbs",
+    "base_short_stocky": "short stocky human build, broad frame",
+    "base_average_athletic": "average height athletic human build",
+    "base_short_slim": "short slim human build, petite frame",
+}
+
+HAIR_CATALOG: dict[str, str] = {
+    "hair_short_black": "short black hair",
+    "hair_long_brown": "long straight brown hair",
+    "hair_ponytail_blonde": "blonde hair tied in a ponytail",
+    "hair_spiky_red": "spiky red hair",
+    "hair_bald": "bald head, no hair",
+    "hair_buzzcut_grey": "grey buzzcut hair",
+}
+
+OUTFIT_CATALOG: dict[str, str] = {
+    "outfit_knight_armor": "silver plate knight armor",
+    "outfit_casual_hoodie": "casual hoodie and jeans",
+    "outfit_mage_robe": "flowing purple mage robe",
+    "outfit_ninja_suit": "dark fitted ninja suit",
+    "outfit_explorer_vest": "brown explorer vest with utility pockets",
+}
+
+SHOES_CATALOG: dict[str, str] = {
+    "shoes_boots_brown": "brown leather boots",
+    "shoes_sneakers_white": "white sneakers",
+    "shoes_sandals": "simple sandals",
+    "shoes_armored_greaves": "armored metal greaves",
+}
+
+ACCESSORY_CATALOG: dict[str, str] = {
+    "accessory_none": "",
+    "accessory_sword": "holding a sword",
+    "accessory_shield": "carrying a round shield",
+    "accessory_backpack": "wearing a small backpack",
+    "accessory_hat": "wearing a wide-brimmed hat",
+    "accessory_staff": "holding a wooden staff",
+}
+
+EXPRESSION_CATALOG: dict[str, str] = {
+    "expr_neutral": "neutral calm expression",
+    "expr_happy": "happy smiling expression",
+    "expr_angry": "angry determined expression",
+    "expr_surprised": "surprised wide-eyed expression",
+}
+
+# Action catalog doubles as the animation spec for tilesheet generation:
+# frame count + per-frame pose hint, matched to the Web team's Idle/Run/
+# Attack preview module.
+ACTION_CATALOG: dict[str, dict[str, Any]] = {
+    "action_idle": {"label": "idle", "frames": 4, "pose": "idle breathing animation"},
+    "action_run": {"label": "running", "frames": 8, "pose": "running cycle animation"},
+    "action_attack": {"label": "attacking", "frames": 6, "pose": "attack swing animation"},
+}
+
+
+def _validate_catalog_id(value: str, catalog: dict[str, Any], field_name: str) -> None:
+    if value not in catalog:
+        raise ValueError(
+            f"Invalid {field_name} '{value}'. Valid values: {sorted(catalog)}"
+        )
+
+
+@dataclass
+class CharacterFormOutput:
+    """Mirrors the Web Character Customizer's Form Output contract. This is the
+    single required input from Web -> AI: everything the generator needs to
+    reproduce the exact combination the user built in the canvas preview."""
+
+    base_id: str
+    hair_id: str
+    outfit_id: str
+    shoes_id: str
+    accessory_id: str = "accessory_none"
+    expression_id: str = "expr_neutral"
+    action: str = "action_idle"
+    facing: str = "front"
+    size_key: str = "sprite_medium"
+    style: str = "pixel_art"
+    seed: int = -1
+
+    def validate(self) -> None:
+        _validate_catalog_id(self.base_id, CHARACTER_BASE_CATALOG, "base_id")
+        _validate_catalog_id(self.hair_id, HAIR_CATALOG, "hair_id")
+        _validate_catalog_id(self.outfit_id, OUTFIT_CATALOG, "outfit_id")
+        _validate_catalog_id(self.shoes_id, SHOES_CATALOG, "shoes_id")
+        _validate_catalog_id(self.accessory_id, ACCESSORY_CATALOG, "accessory_id")
+        _validate_catalog_id(self.expression_id, EXPRESSION_CATALOG, "expression_id")
+        _validate_catalog_id(self.action, ACTION_CATALOG, "action")
+        if self.facing not in {"front", "side", "back", "three-quarter"}:
+            raise ValueError(f"Invalid facing '{self.facing}'")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CharacterFormOutput":
+        known = {f for f in cls.__dataclass_fields__}
+        filtered = {k: v for k, v in data.items() if k in known}
+        missing = {"base_id", "hair_id", "outfit_id", "shoes_id"} - filtered.keys()
+        if missing:
+            raise ValueError(f"Form Output missing required field(s): {sorted(missing)}")
+        return cls(**filtered)
+
+
 _CUSTOM_SIZE_RE = re.compile(r"^\s*(\d{1,5})\s*[xX]\s*(\d{1,5})\s*$")
+
+
+# Bottom-to-top paste order for layer compositing. "accessory_none" is skipped
+# (no file needed for "no accessory").
+CHARACTER_LAYER_ORDER: list[str] = ["base", "shoes", "outfit", "hair", "accessory"]
+
+
+class AssetCompositor:
+    """Ghép layer: loads pre-generated PNG parts from disk and alpha-composites
+    them into one character image. No AI call — this is what makes the Web
+    real-time preview (and this endpoint's fast path) instant and deterministic.
+    Expects files at ``<asset_dir>/<category>/<part_id>.png``, one per catalog ID.
+
+    Each part is generated independently by AI with no shared skeleton/anchor, so
+    naive full-canvas overlay produces misaligned results (hair floating in the
+    wrong place, shoes detached from legs, etc). `auto_align` mitigates this with
+    a bounding-box heuristic: crop each part to its actual content, rescale it to
+    a target fraction of the base body's height, and anchor it to a logical
+    position (hair -> top, shoes -> bottom, outfit -> upper-center, accessory ->
+    center). This is an approximation, not true rigging — expect it to still need
+    manual touch-up for production art."""
+
+    # Per-category (target_height_fraction_of_base, max_width_fraction_of_canvas,
+    # vertical_anchor, horizontal_offset_fraction_of_base_width) heuristic.
+    # Height scales against the base body's own height (how big the part should
+    # look relative to this character). The width cap is a safety ceiling against
+    # the full canvas, not the body's own (much narrower) silhouette — a
+    # diagonally-held sword or a flared robe legitimately extends past the torso.
+    _ALIGN_RULES: dict[str, tuple[float, float, str, float]] = {
+        "hair": (0.22, 0.55, "top", 0.0),
+        "outfit": (0.58, 0.85, "upper", 0.0),
+        "shoes": (0.14, 0.55, "bottom", 0.0),
+        # A held weapon/item sits at the character's side, not dead-center over
+        # the torso — offset it right by 22% of body width so it doesn't paper
+        # over the outfit.
+        "accessory": (0.42, 0.70, "center", 0.22),
+    }
+
+    @staticmethod
+    def _alpha_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
+        return img.getchannel("A").getbbox()
+
+    @staticmethod
+    def compose_layers(
+        asset_dir: str | Path,
+        form: "CharacterFormOutput",
+        auto_align: bool = True,
+    ) -> Image.Image:
+        asset_dir = Path(asset_dir)
+        canvas_w, canvas_h = resolve_size(form.size_key, SPRITE_SIZE_KEYS, "sprite")
+        result = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+        part_ids = {
+            "base": form.base_id,
+            "shoes": form.shoes_id,
+            "outfit": form.outfit_id,
+            "hair": form.hair_id,
+            "accessory": form.accessory_id,
+        }
+
+        missing: list[str] = []
+        base_bbox: tuple[int, int, int, int] | None = None
+
+        for category in CHARACTER_LAYER_ORDER:
+            part_id = part_ids[category]
+            if category == "accessory" and part_id == "accessory_none":
+                continue
+            layer_path = asset_dir / category / f"{part_id}.png"
+            if not layer_path.exists():
+                missing.append(str(layer_path))
+                continue
+
+            layer_img = Image.open(layer_path).convert("RGBA")
+            if layer_img.size != (canvas_w, canvas_h):
+                layer_img = layer_img.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
+
+            if category == "base":
+                base_bbox = AssetCompositor._alpha_bbox(layer_img)
+                result = Image.alpha_composite(result, layer_img)
+                continue
+
+            if not auto_align or category not in AssetCompositor._ALIGN_RULES:
+                result = Image.alpha_composite(result, layer_img)
+                continue
+
+            bbox = AssetCompositor._alpha_bbox(layer_img)
+            if bbox is None:
+                continue  # fully transparent layer (e.g. hair_bald) — nothing to place
+
+            bx0, by0, bx1, by1 = base_bbox or (0, 0, canvas_w, canvas_h)
+            base_h = max(1, by1 - by0)
+            base_w = max(1, bx1 - bx0)
+            base_cx = (bx0 + bx1) / 2
+
+            lx0, ly0, lx1, ly1 = bbox
+            lw, lh = max(1, lx1 - lx0), max(1, ly1 - ly0)
+            cropped = layer_img.crop(bbox)
+
+            target_h_frac, max_w_frac, anchor, x_offset_frac = AssetCompositor._ALIGN_RULES[category]
+            scale_by_height = (base_h * target_h_frac) / lh
+            scale_by_width = (canvas_w * max_w_frac) / lw
+            scale = min(scale_by_height, scale_by_width)
+            new_w, new_h = max(1, round(lw * scale)), max(1, round(lh * scale))
+            resized = cropped.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            px = round(base_cx - new_w / 2 + base_w * x_offset_frac)
+            if anchor == "top":
+                py = by0
+            elif anchor == "bottom":
+                py = by1 - new_h
+            elif anchor == "upper":
+                py = by0 + round(base_h * 0.15)
+            else:  # "center"
+                py = by0 + round((base_h - new_h) / 2)
+
+            layer_canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            layer_canvas.paste(resized, (px, py), resized)
+            result = Image.alpha_composite(result, layer_canvas)
+
+        if missing:
+            raise FileNotFoundError(
+                "Missing character asset layer(s), expected at: " + "; ".join(missing)
+            )
+        return result
 
 
 def resolve_size(value: str, allowed_keys: set[str], label: str) -> tuple[int, int]:
@@ -345,6 +584,32 @@ class PromptOptimizer:
         )
 
     @staticmethod
+    def build_character_prompt(
+        form: "CharacterFormOutput",
+        frame_pose: str | None = None,
+    ) -> str:
+        """Compose a prompt from a validated Form Output. `frame_pose` overrides the
+        action's base pose text for a specific animation frame (see ACTION_CATALOG)."""
+        style_tag = PromptOptimizer.STYLE_TAGS.get(form.style, form.style)
+        parts = [
+            CHARACTER_BASE_CATALOG[form.base_id],
+            HAIR_CATALOG[form.hair_id],
+            OUTFIT_CATALOG[form.outfit_id],
+            SHOES_CATALOG[form.shoes_id],
+            ACCESSORY_CATALOG[form.accessory_id],
+            EXPRESSION_CATALOG[form.expression_id],
+        ]
+        pose = frame_pose or ACTION_CATALOG[form.action]["pose"]
+        description = ", ".join(p for p in parts if p)
+        return (
+            f"{description}, {pose}, {form.facing} facing, full body, "
+            f"single centered character, isolated, transparent background, "
+            f"game sprite, {style_tag}, flat solid colors, no gradients, "
+            f"no blur, sharp clean pixel edges, consistent character design, "
+            f"clean silhouette, no scenery"
+        )
+
+    @staticmethod
     def get_negative_prompt(asset_type: str = "general") -> str:
         extras = {
             "background": ", characters, people, HUD, UI elements",
@@ -353,6 +618,17 @@ class PromptOptimizer:
             "tile": (
                 ", multiple tiles, full tileset, sprite sheet, grid lines, ruler, "
                 "perspective, isometric, drop shadow, background scenery, frame border"
+            ),
+            "character": (
+                ", background scenery, multiple characters, multiple poses, "
+                "gradient shading, dithering noise, jpeg artifacts, soft edges"
+            ),
+            "isolated_part": (
+                ", person, human, character, body, full figure, torso, arms, legs, "
+                "hands, face, head, skull, portrait, bust, npc, model wearing it, "
+                "worn, wearing, equipped on a character, mannequin with a face, "
+                "holding it, wielding it, scene, background story, environment, "
+                "multiple objects, other characters, inventory grid, item frame, ui border"
             ),
         }
         return PromptOptimizer.NEGATIVE_BASE + extras.get(asset_type, "")
@@ -403,19 +679,19 @@ class PollinationsProvider:
             "width": width,
             "height": height,
             "seed": actual_seed,
-            "nologo": str(self.nologo).lower(),
-            "private": str(self.private).lower(),
-            "enhance": str(self.enhance).lower(),
         }
+        headers: dict[str, str] = {}
         if self.api_key:
-            # Pollinations deployments have used both key/token naming; sending both is harmless for GET params.
-            params["key"] = self.api_key
-            params["token"] = self.api_key
+            # Current Pollinations API (gen.pollinations.ai) authenticates via
+            # Bearer header, not query params. nologo/enhance/private query params
+            # were dropped from the current image API (2026-06-10 changelog) so
+            # they're no longer sent here.
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         last_error: Exception | None = None
         for attempt in range(1, self.retries + 1):
             try:
-                response = requests.get(url, params=params, timeout=self.timeout)
+                response = requests.get(url, params=params, headers=headers, timeout=self.timeout)
                 response.raise_for_status()
 
                 content_type = response.headers.get("content-type", "")
@@ -530,8 +806,17 @@ class PollinationsCaptioner:
 class ImageGenerator:
     """Backward-compatible wrapper around the selected provider."""
 
-    def __init__(self, api_key: str = API_KEY, model: str = "flux", provider: AIImageProvider | None = None):
-        self.provider = provider or PollinationsProvider(api_key=api_key, model=model)
+    def __init__(
+        self,
+        api_key: str = API_KEY,
+        model: str = "flux",
+        provider: AIImageProvider | None = None,
+        timeout: int = 90,
+        retries: int = 3,
+    ):
+        self.provider = provider or PollinationsProvider(
+            api_key=api_key, model=model, timeout=timeout, retries=retries
+        )
 
     def generate(
         self,
@@ -625,20 +910,83 @@ class AssetPostProcessor:
         w, h = img.size
         small_w = max(1, w // block_size)
         small_h = max(1, h // block_size)
-        small = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        # BOX (area-average) downscale instead of NEAREST: NEAREST point-samples a
+        # single source pixel per block, which on a soft AI-generated image tends to
+        # grab a stray anti-aliased pixel and produces the "vỡ hạt" (grainy/broken)
+        # look. BOX averages every pixel in the block, so each block's color reflects
+        # what's actually there before we snap it to a hard pixel grid.
+        small = img.resize((small_w, small_h), Image.Resampling.BOX)
         return small.resize((w, h), Image.Resampling.NEAREST)
 
     @staticmethod
-    def reduce_palette(img: Image.Image, colors: int = 32) -> Image.Image:
+    def reduce_palette(img: Image.Image, colors: int = 32, dither: bool = False) -> Image.Image:
         if colors < 2 or colors > 256:
             raise ValueError("colors must be between 2 and 256")
 
         img = img.convert("RGBA")
         alpha = img.getchannel("A")
         rgb = img.convert("RGB")
-        reduced = rgb.quantize(colors=colors).convert("RGBA")
+        dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+        reduced = rgb.quantize(
+            colors=colors,
+            method=Image.Quantize.MEDIANCUT,
+            dither=dither_mode,
+        ).convert("RGBA")
         reduced.putalpha(alpha)
         return reduced
+
+    @staticmethod
+    def clean_alpha_edges(img: Image.Image, threshold: int = 128) -> Image.Image:
+        """Binarize the alpha channel (fully opaque or fully transparent, no
+        in-between). Semi-transparent edge pixels left over from background removal
+        or resampling read as a grey/broken outline once composited into a game —
+        this snaps every pixel to one state or the other for a clean silhouette."""
+        img = img.convert("RGBA")
+        alpha = img.getchannel("A").point(lambda a: 255 if a >= threshold else 0)
+        cleaned = img.copy()
+        cleaned.putalpha(alpha)
+        return cleaned
+
+    @staticmethod
+    def pixelate_clean(
+        img: Image.Image,
+        block_size: int = 8,
+        colors: int = 32,
+        alpha_threshold: int = 128,
+        sharpen: bool = True,
+    ) -> Image.Image:
+        """End-to-end 'fix the blur, fix the broken pixels' pipeline, in the order
+        that actually matters:
+
+        1. Unsharp-mask the source AI image (it usually arrives a bit soft) so real
+           edges survive the downscale instead of being averaged into mush.
+        2. Downscale to the pixel grid with BOX averaging (see apply_pixel_art_effect).
+        3. Quantize the SMALL image's palette with dithering off (dithering is what
+           produces the speckled/broken look — it scatters noise to fake extra
+           colors, which is the opposite of what a clean retro palette wants).
+        4. Binarize alpha so edges are crisp instead of a grey halo.
+        5. Upscale with NEAREST for hard pixel edges.
+
+        Quantizing the small image (step 3) before the final upscale (step 5) is the
+        key fix versus the old pipeline, which quantized *after* upscaling and let
+        PIL's default dithering run on a full-size image.
+        """
+        img = img.convert("RGBA")
+        if sharpen:
+            from PIL import ImageFilter
+
+            rgb = img.convert("RGB").filter(
+                ImageFilter.UnsharpMask(radius=2, percent=120, threshold=3)
+            )
+            img = Image.merge("RGBA", (*rgb.split(), img.getchannel("A")))
+
+        w, h = img.size
+        small_w = max(1, w // block_size)
+        small_h = max(1, h // block_size)
+        small = img.resize((small_w, small_h), Image.Resampling.BOX)
+        small = AssetPostProcessor.reduce_palette(small, colors=colors, dither=False)
+        small = AssetPostProcessor.clean_alpha_edges(small, threshold=alpha_threshold)
+        return small.resize((w, h), Image.Resampling.NEAREST)
 
     @staticmethod
     def remove_background(img: Image.Image, threshold: int = 245) -> Image.Image:
@@ -764,8 +1112,10 @@ class GameAssetStudio:
         output_dir: str | Path = OUTPUT_DIR,
         provider: AIImageProvider | None = None,
         captioner: ImageCaptioner | None = None,
+        timeout: int = 90,
+        retries: int = 3,
     ):
-        self.gen = ImageGenerator(api_key=api_key, model=model, provider=provider)
+        self.gen = ImageGenerator(api_key=api_key, model=model, provider=provider, timeout=timeout, retries=retries)
         self.proc = AssetPostProcessor()
         self.captioner = captioner or PollinationsCaptioner(api_key=api_key)
         self.out = Path(output_dir)
@@ -819,11 +1169,13 @@ class GameAssetStudio:
         img = result.image
         if transparent_bg:
             img = self.proc.remove_background(img)
-        img = self.proc.fit_to_canvas(
-            img,
-            (width, height),
-            resample=Image.Resampling.NEAREST if style == "pixel_art" else Image.Resampling.LANCZOS,
-        )
+            img = self.proc.clean_alpha_edges(img)
+        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
+        if style == "pixel_art":
+            # Route through the same anti-blur/anti-speckle pipeline used by the
+            # explicit `pixel` command, so every pixel-art sprite is game-ready
+            # (sharp edges, flat palette, clean silhouette) not just pixel_art asset.
+            img = self.proc.pixelate_clean(img, block_size=max(2, min(width, height) // 64), colors=48)
 
         out_name = self._safe_name(filename or f"sprite_{subject}_{size_key}")
         path = self.out / "sprites" / f"{out_name}.png"
@@ -849,9 +1201,8 @@ class GameAssetStudio:
             negative_prompt=PromptOptimizer.get_negative_prompt("sprite"),
         )
 
-        img = self.proc.fit_to_canvas(result.image, (width, height), resample=Image.Resampling.NEAREST)
-        img = self.proc.apply_pixel_art_effect(img, block_size=block_size)
-        img = self.proc.reduce_palette(img, colors=colors)
+        img = self.proc.fit_to_canvas(result.image, (width, height), resample=Image.Resampling.LANCZOS)
+        img = self.proc.pixelate_clean(img, block_size=block_size, colors=colors)
 
         out_name = self._safe_name(filename or f"pixel_{subject}_{size_key}")
         path = self.out / "pixel_art" / f"{out_name}.png"
@@ -870,9 +1221,8 @@ class GameAssetStudio:
         width, height = resolve_size(size_key, PIXEL_SIZE_KEYS, "pixel art")
         source = Path(image_path)
         img = Image.open(source).convert("RGBA")
-        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.NEAREST)
-        img = self.proc.apply_pixel_art_effect(img, block_size=block_size)
-        img = self.proc.reduce_palette(img, colors=colors)
+        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
+        img = self.proc.pixelate_clean(img, block_size=block_size, colors=colors)
 
         out_name = self._safe_name(filename or f"pixel_from_{source.stem}_{size_key}")
         path = self.out / "pixel_art" / f"{out_name}.png"
@@ -949,6 +1299,436 @@ class GameAssetStudio:
             asset.warnings = caption.warnings + asset.warnings
         return asset
 
+    def generate_character(
+        self,
+        form: CharacterFormOutput | dict[str, Any],
+        filename: str | None = None,
+        block_size: int | None = None,
+        colors: int = 48,
+        save_raw: bool = False,
+    ) -> GeneratedAsset:
+        """Generate a single-pose character sprite from a Web Character Customizer
+        Form Output. Validates every part ID against the catalog before spending an
+        API call, then routes through the same anti-blur/anti-speckle pixelate_clean
+        pipeline as `generate_sprite`/`generate_pixel_art` so output is game-ready.
+
+        `block_size` controls pixel-art granularity: smaller = more detail retained
+        (a full-body character with armor/weapon needs finer blocks than an icon).
+        Defaults to canvas_size // 64 if not given. Pass `save_raw=True` to also
+        save the pre-pixelation image (`<name>_raw.png`) for A/B comparison when
+        debugging whether a bad result comes from generation or post-processing.
+        """
+        if isinstance(form, dict):
+            form = CharacterFormOutput.from_dict(form)
+        form.validate()
+
+        width, height = resolve_size(form.size_key, SPRITE_SIZE_KEYS, "sprite")
+        prompt = PromptOptimizer.build_character_prompt(form)
+        result = self.gen.generate_with_metadata(
+            prompt,
+            width=max(width, 512),
+            height=max(height, 512),
+            seed=form.seed,
+            negative_prompt=PromptOptimizer.get_negative_prompt("character"),
+        )
+
+        img = self.proc.remove_background(result.image)
+        img = self.proc.clean_alpha_edges(img)
+        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
+
+        out_name = self._safe_name(
+            filename or f"char_{form.base_id}_{form.hair_id}_{form.outfit_id}_{form.size_key}"
+        )
+
+        if save_raw:
+            raw_path = self.out / "sprites" / f"{out_name}_raw.png"
+            self.proc.save(img, raw_path)
+
+        if form.style == "pixel_art":
+            effective_block = block_size if block_size is not None else max(2, min(width, height) // 64)
+            img = self.proc.pixelate_clean(img, block_size=effective_block, colors=colors)
+
+        path = self.out / "sprites" / f"{out_name}.png"
+        self.proc.save(img, path)
+        return self._asset_metadata("character", prompt, result, img, path)
+
+    def generate_character_animation(
+        self,
+        form: CharacterFormOutput | dict[str, Any],
+        slice_frames: bool = False,
+        filename: str | None = None,
+        block_size: int | None = None,
+        colors: int = 48,
+    ) -> GeneratedAsset:
+        """Generate the animation sheet for a Form Output's `action` (idle/run/
+        attack, per ACTION_CATALOG), keeping the character's parts identical across
+        every frame and sharing one base seed for visual consistency."""
+        if isinstance(form, dict):
+            form = CharacterFormOutput.from_dict(form)
+        form.validate()
+
+        action_spec = ACTION_CATALOG[form.action]
+        frames = action_spec["frames"]
+        frame_size = ASSET_SIZES[form.size_key] if form.size_key in ASSET_SIZES else resolve_size(
+            form.size_key, SPRITE_SIZE_KEYS, "sprite"
+        )
+
+        generated_frames: list[Image.Image] = []
+        warnings: list[str] = []
+        provider_name = ""
+        model = ""
+        base_seed = form.seed if form.seed >= 0 else random.randint(0, 2_147_483_647 - frames)
+        used_seed = base_seed
+
+        for index in range(frames):
+            frame_pose = f"{action_spec['pose']}, frame {index + 1} of {frames}"
+            prompt = PromptOptimizer.build_character_prompt(form, frame_pose=frame_pose)
+            result = self.gen.generate_with_metadata(
+                prompt,
+                width=max(frame_size[0], 512),
+                height=max(frame_size[1], 512),
+                seed=base_seed + index,
+                negative_prompt=PromptOptimizer.get_negative_prompt("character"),
+            )
+            provider_name = result.provider
+            model = result.model
+            warnings.extend(result.warnings)
+
+            frame = self.proc.remove_background(result.image)
+            frame = self.proc.clean_alpha_edges(frame)
+            frame = self.proc.fit_to_canvas(frame, frame_size, resample=Image.Resampling.LANCZOS)
+            if form.style == "pixel_art":
+                effective_block = block_size if block_size is not None else max(2, min(frame_size) // 64)
+                frame = self.proc.pixelate_clean(frame, block_size=effective_block, colors=colors)
+            generated_frames.append(frame)
+
+        sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
+        out_name = self._safe_name(
+            filename or f"char_{form.base_id}_{form.outfit_id}_{action_spec['label']}"
+        )
+        path = self.out / "tilesheets" / f"{out_name}.png"
+        self.proc.save(sheet, path)
+
+        frame_meta: list[FrameMetadata] = []
+        for index, frame in enumerate(generated_frames):
+            frame_path: Path | None = None
+            if slice_frames:
+                frame_path = self.out / "tilesheets" / out_name / f"frame_{index:02d}.png"
+                self.proc.save(frame, frame_path)
+            frame_meta.append(
+                FrameMetadata(
+                    index=index,
+                    x=index * frame_size[0],
+                    y=0,
+                    w=frame_size[0],
+                    h=frame_size[1],
+                    file_path=str(frame_path) if frame_path else None,
+                )
+            )
+
+        prompt_summary = f"character animation: {form.action} ({frames} frames)"
+        return GeneratedAsset(
+            asset_id=str(uuid.uuid4()),
+            asset_type="character_animation",
+            prompt=prompt_summary,
+            provider=provider_name,
+            model=model,
+            seed=used_seed,
+            width=sheet.width,
+            height=sheet.height,
+            format="png",
+            file_path=str(path),
+            has_alpha=True,
+            frames=frame_meta,
+            warnings=warnings,
+        )
+
+    def compose_character(
+        self,
+        form: CharacterFormOutput | dict[str, Any],
+        asset_dir: str | Path = "character_assets",
+        auto_align: bool = True,
+    ) -> Image.Image:
+        """Ghép layer only — no AI call. Loads the pre-generated base/hair/outfit/
+        shoes/accessory PNGs and alpha-composites them per the Form Output. This is
+        the server-side equivalent of Web's real-time canvas preview: same asset
+        library, same naming convention, deterministic output. Raises
+        FileNotFoundError naming exactly which layer file is missing, so gaps in
+        the AI-delivered asset library are obvious immediately rather than
+        surfacing as a vague generation failure later.
+
+        `auto_align=True` (default) rescales/repositions each part via a bounding-
+        box heuristic since independently-generated parts share no skeleton. Pass
+        False for raw full-canvas overlay (e.g. once assets are manually pre-
+        aligned to the exact same anchor points by an artist)."""
+        if isinstance(form, dict):
+            form = CharacterFormOutput.from_dict(form)
+        form.validate()
+        return AssetCompositor.compose_layers(asset_dir, form, auto_align=auto_align)
+
+    def generate_character_animation_from_layers(
+        self,
+        form: CharacterFormOutput | dict[str, Any],
+        asset_dir: str | Path = "character_assets",
+        slice_frames: bool = False,
+        filename: str | None = None,
+        block_size: int | None = None,
+        colors: int = 48,
+    ) -> GeneratedAsset:
+        """The actual 'nhận lựa chọn custom -> ghép layer -> generate animation'
+        endpoint flow: compose the real PNG layers (no AI), caption that composited
+        look with the vision model, then generate the action's animation frames
+        grounded in that caption instead of pure catalog text — so the animation
+        actually matches the specific parts the user picked, not just a generic
+        text description of the category."""
+        if isinstance(form, dict):
+            form = CharacterFormOutput.from_dict(form)
+        form.validate()
+
+        composited = AssetCompositor.compose_layers(asset_dir, form)
+        caption = self.captioner.describe(
+            composited.convert("RGB"), instruction=DEFAULT_CHARACTER_CAPTION_INSTRUCTION
+        )
+
+        action_spec = ACTION_CATALOG[form.action]
+        frames = action_spec["frames"]
+        frame_size = resolve_size(form.size_key, SPRITE_SIZE_KEYS, "sprite")
+
+        generated_frames: list[Image.Image] = []
+        warnings: list[str] = list(caption.warnings)
+        provider_name = ""
+        model = ""
+        base_seed = form.seed if form.seed >= 0 else random.randint(0, 2_147_483_647 - frames)
+
+        for index in range(frames):
+            frame_pose = f"{action_spec['pose']}, frame {index + 1} of {frames}"
+            prompt = (
+                f"[reference character: {caption.description}] "
+                f"{PromptOptimizer.build_character_prompt(form, frame_pose=frame_pose)}"
+            )
+            result = self.gen.generate_with_metadata(
+                prompt,
+                width=max(frame_size[0], 512),
+                height=max(frame_size[1], 512),
+                seed=base_seed + index,
+                negative_prompt=PromptOptimizer.get_negative_prompt("character"),
+            )
+            provider_name = result.provider
+            model = result.model
+            warnings.extend(result.warnings)
+
+            frame = self.proc.remove_background(result.image)
+            frame = self.proc.clean_alpha_edges(frame)
+            frame = self.proc.fit_to_canvas(frame, frame_size, resample=Image.Resampling.LANCZOS)
+            if form.style == "pixel_art":
+                effective_block = block_size if block_size is not None else max(2, min(frame_size) // 64)
+                frame = self.proc.pixelate_clean(frame, block_size=effective_block, colors=colors)
+            generated_frames.append(frame)
+
+        sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
+        out_name = self._safe_name(
+            filename or f"charlayer_{form.base_id}_{form.outfit_id}_{action_spec['label']}"
+        )
+        path = self.out / "tilesheets" / f"{out_name}.png"
+        self.proc.save(sheet, path)
+
+        frame_meta: list[FrameMetadata] = []
+        for index, frame in enumerate(generated_frames):
+            frame_path: Path | None = None
+            if slice_frames:
+                frame_path = self.out / "tilesheets" / out_name / f"frame_{index:02d}.png"
+                self.proc.save(frame, frame_path)
+            frame_meta.append(
+                FrameMetadata(
+                    index=index,
+                    x=index * frame_size[0],
+                    y=0,
+                    w=frame_size[0],
+                    h=frame_size[1],
+                    file_path=str(frame_path) if frame_path else None,
+                )
+            )
+
+        return GeneratedAsset(
+            asset_id=str(uuid.uuid4()),
+            asset_type="character_animation_from_layers",
+            prompt=f"layered character animation: {form.action} ({frames} frames); caption: {caption.description[:160]}",
+            provider=provider_name,
+            model=model,
+            seed=base_seed,
+            width=sheet.width,
+            height=sheet.height,
+            format="png",
+            file_path=str(path),
+            has_alpha=True,
+            frames=frame_meta,
+            warnings=warnings,
+        )
+
+    def generate_character_asset_library(
+        self,
+        asset_dir: str | Path = "character_assets",
+        size_key: str = "sprite_medium",
+        overwrite: bool = False,
+        categories: list[str] | None = None,
+    ) -> dict[str, list[str]]:
+        """One-time batch job: generates the base-body + overlay PNG library from
+        the AI-Team checklist (3-4 base bodies, 4-6 options per part category) and
+        saves them under ``<asset_dir>/<category>/<id>.png`` — the exact layout
+        AssetCompositor/Web's canvas expect. Run this once with a real API key to
+        produce the first draft of the asset library; AI-isolated overlays (hair/
+        outfit/shoes with no body to anchor proportions to) are approximate, so
+        review and align each file before handing the library to Web.
+
+        `categories` restricts the run to a subset (e.g. ["hair", "outfit"]) —
+        useful for regenerating just the categories that came out badly without
+        re-spending API calls on ones that already look right."""
+        asset_dir = Path(asset_dir)
+        width, height = resolve_size(size_key, SPRITE_SIZE_KEYS, "sprite")
+        style_tag = PromptOptimizer.STYLE_TAGS.get("pixel_art", "pixel art")
+        generated: dict[str, list[str]] = {}
+
+        def _generate_one(category: str, part_id: str, descriptor: str, extra: str, negative_category: str) -> str:
+            out_path = asset_dir / category / f"{part_id}.png"
+            if out_path.exists() and not overwrite:
+                return str(out_path)
+
+            if part_id == "hair_bald":
+                # "Bald" isn't a hairstyle to isolate — there's nothing to draw, so
+                # asking the model for one just gets a bust/neck sketched in to fill
+                # the frame. Skip generation and ship an empty transparent layer,
+                # same semantics as accessory_none.
+                blank = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                self.proc.save(blank, out_path)
+                return str(out_path)
+
+            prompt = (
+                f"{descriptor}, {extra}, centered, transparent background, "
+                f"{style_tag}, flat solid colors, no gradients, sharp clean pixel edges"
+            )
+            result = self.gen.generate_with_metadata(
+                prompt,
+                width=max(width, 512),
+                height=max(height, 512),
+                seed=-1,
+                negative_prompt=PromptOptimizer.get_negative_prompt(negative_category),
+            )
+            img = self.proc.remove_background(result.image)
+            img = self.proc.clean_alpha_edges(img)
+            img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
+            block = max(2, min(width, height) // 64)
+            img = self.proc.pixelate_clean(img, block_size=block, colors=48)
+            self.proc.save(img, out_path)
+            return str(out_path)
+
+        # Base bodies keep the "character" negative prompt (they're SUPPOSED to be
+        # a person). Every overlay category uses "isolated_part" — a much stronger
+        # negative prompt specifically excluding person/body/face/scene — because
+        # a first pass with only positive-side "no body" phrasing still rendered
+        # full characters/scenes for hair, outfit, and accessory items.
+        base_specs = [
+            (
+                part_id, descriptor,
+                "plain grey mannequin base body, neutral T-pose, no clothes, no hair, "
+                "blank featureless face, front facing, full body",
+                "character",
+            )
+            for part_id, descriptor in CHARACTER_BASE_CATALOG.items()
+        ]
+        hair_specs = [
+            (
+                part_id, descriptor,
+                "wig icon as seen in a character creator / avatar customization menu, "
+                "hairstyle item icon, no face, no eyes, no nose, no mouth, no skin, "
+                "no neck, no shoulders, no clothing, floating hair shape only on "
+                "transparent background",
+                "isolated_part",
+            )
+            for part_id, descriptor in HAIR_CATALOG.items()
+        ]
+        # Per-item override for outfits that kept rendering a full standing figure
+        # under the generic "flat lay" framing after 2 rounds of retries — a
+        # different photography style (hanging on a rack) for just these stubborn
+        # IDs, rather than risking a global prompt change that could regress the
+        # outfits already working (vest, armor, robe).
+        _outfit_overrides = {
+            "outfit_casual_hoodie": (
+                "clothing item hanging on a wooden clothes hanger, retail clothing "
+                "store photography, empty hoodie and pants on a hanger, no person, "
+                "no body, no head, no arms, no legs inside the clothes, not worn"
+            ),
+            "outfit_ninja_suit": (
+                "clothing item hanging on a wooden clothes hanger, retail clothing "
+                "store photography, empty ninja suit on a hanger, no person, no body, "
+                "no head, no arms, no legs inside the clothes, not worn"
+            ),
+        }
+        outfit_specs = [
+            (
+                part_id, descriptor,
+                _outfit_overrides.get(
+                    part_id,
+                    "flat lay clothing photography, the garment laid out flat and "
+                    "empty, sleeves and pant legs lying flat with nothing inside "
+                    "them, RPG inventory equipment icon style, no person, no body, "
+                    "no head, no arms, no legs, no hands, not worn, not being worn "
+                    "by anyone",
+                ),
+                "isolated_part",
+            )
+            for part_id, descriptor in OUTFIT_CATALOG.items()
+        ]
+        shoes_specs = [
+            (
+                part_id, descriptor,
+                "RPG inventory equipment icon of a pair of shoes, item icon as shown "
+                "in a game inventory screen, no feet, no legs, no person",
+                "isolated_part",
+            )
+            for part_id, descriptor in SHOES_CATALOG.items()
+        ]
+        def _strip_action_verb(text: str) -> str:
+            """ACCESSORY_CATALOG descriptors are written for the full-character
+            prompt ('wearing a wide-brimmed hat', 'holding a sword') — reused
+            verbatim here, that verb fights directly against the 'no person, not
+            worn' isolation instruction. Strip it so the asset-library prompt gets
+            just the noun phrase ('a wide-brimmed hat')."""
+            for prefix in ("wearing ", "holding ", "carrying "):
+                if text.startswith(prefix):
+                    return text[len(prefix):]
+            return text
+
+        accessory_specs = [
+            (
+                part_id, _strip_action_verb(descriptor),
+                "RPG inventory item icon, single loot/equipment icon as shown in a "
+                "game inventory screen, the object lying by itself, not held, not worn, "
+                "no hands, no person, no character, no scene, no background story",
+                "isolated_part",
+            )
+            for part_id, descriptor in ACCESSORY_CATALOG.items()
+            if part_id != "accessory_none"
+        ]
+
+        all_specs = {
+            "base": base_specs,
+            "hair": hair_specs,
+            "outfit": outfit_specs,
+            "shoes": shoes_specs,
+            "accessory": accessory_specs,
+        }
+        selected = categories if categories is not None else list(all_specs)
+
+        for category in selected:
+            if category not in all_specs:
+                raise ValueError(f"Unknown category '{category}'. Valid: {sorted(all_specs)}")
+            generated[category] = [
+                _generate_one(category, part_id, descriptor, extra, negative_category)
+                for part_id, descriptor, extra, negative_category in all_specs[category]
+            ]
+
+        return generated
+
     def generate_tilesheet(
         self,
         subject: str,
@@ -991,11 +1771,12 @@ class GameAssetStudio:
             warnings.extend(result.warnings)
 
             frame = self.proc.remove_background(result.image)
-            frame = self.proc.fit_to_canvas(
-                frame,
-                frame_size,
-                resample=Image.Resampling.NEAREST if style == "pixel_art" else Image.Resampling.LANCZOS,
-            )
+            frame = self.proc.clean_alpha_edges(frame)
+            frame = self.proc.fit_to_canvas(frame, frame_size, resample=Image.Resampling.LANCZOS)
+            if style == "pixel_art":
+                frame = self.proc.pixelate_clean(
+                    frame, block_size=max(2, min(frame_size) // 64), colors=48
+                )
             generated_frames.append(frame)
 
         sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
@@ -1095,11 +1876,10 @@ class GameAssetStudio:
             img = result.image
             if transparent_bg:
                 img = self.proc.remove_background(img)
-            img = self.proc.fit_to_canvas(
-                img,
-                (cell_w, cell_h),
-                resample=Image.Resampling.NEAREST if style == "pixel_art" else Image.Resampling.LANCZOS,
-            )
+                img = self.proc.clean_alpha_edges(img)
+            img = self.proc.fit_to_canvas(img, (cell_w, cell_h), resample=Image.Resampling.LANCZOS)
+            if style == "pixel_art":
+                img = self.proc.pixelate_clean(img, block_size=max(2, min(cell_w, cell_h) // 16), colors=32)
             generated_tiles.append(img)
 
         sheet = self.proc.compose_grid(

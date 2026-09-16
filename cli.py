@@ -10,6 +10,8 @@ Examples:
   python cli.py tilesheet "walking cat" --frames 10 --frame-width 64 --frame-height 64 --slice
   python cli.py tileset --preset platformer_basic --cell-size tile_32 --columns 8 --slice
   python cli.py tileset "grass ground tile" "water tile" "lava tile" --cell-size tile_16 --columns 4
+  python cli.py character --base base_tall_slim --hair hair_short_black --outfit outfit_knight_armor --shoes shoes_boots_brown
+  python cli.py character --form-file form_output.json --animate --slice
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -27,11 +30,19 @@ except ImportError:
     pass  # chưa cài python-dotenv -> vẫn dùng biến môi trường set tay như bình thường
 
 from asset_generator import (
+    ACCESSORY_CATALOG,
+    ACTION_CATALOG,
     BACKGROUND_SIZE_KEYS,
+    CHARACTER_BASE_CATALOG,
+    EXPRESSION_CATALOG,
+    HAIR_CATALOG,
+    OUTFIT_CATALOG,
     PIXEL_SIZE_KEYS,
+    SHOES_CATALOG,
     SPRITE_SIZE_KEYS,
     TILE_PRESETS,
     TILE_SIZE_KEYS,
+    CharacterFormOutput,
     GameAssetStudio,
     resolve_size,
 )
@@ -71,6 +82,15 @@ def main() -> None:
         description="AI Game Asset Studio - generate embeddable game assets",
     )
     parser.add_argument("--model", default="flux", help="Image model/provider model name")
+    parser.add_argument(
+        "--timeout", type=int, default=90,
+        help="HTTP timeout (seconds) per image-generation request. Raise this if you're seeing "
+        "ReadTimeout/handshake-timeout errors on a slow or restricted network.",
+    )
+    parser.add_argument(
+        "--retries", type=int, default=3,
+        help="Retry attempts per image-generation request before giving up.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_bg = sub.add_parser("background", help="Generate a game background")
@@ -208,11 +228,135 @@ def main() -> None:
         "asset JSON, ready for a web frontend to preview/slice without filesystem access.",
     )
 
+    p_char = sub.add_parser(
+        "character",
+        help="Generate a character sprite (or its idle/run/attack animation) from a "
+        "Web Character Customizer Form Output",
+    )
+    p_char.add_argument(
+        "--form-file",
+        default=None,
+        help="Path to a Form Output JSON file, e.g. exported by the Web Character "
+        "Customizer ({base_id, hair_id, outfit_id, shoes_id, accessory_id, "
+        "expression_id, action, facing, size_key, style, seed}). Overrides individual flags below.",
+    )
+    p_char.add_argument("--base", dest="base_id", choices=sorted(CHARACTER_BASE_CATALOG), default=None)
+    p_char.add_argument("--hair", dest="hair_id", choices=sorted(HAIR_CATALOG), default=None)
+    p_char.add_argument("--outfit", dest="outfit_id", choices=sorted(OUTFIT_CATALOG), default=None)
+    p_char.add_argument("--shoes", dest="shoes_id", choices=sorted(SHOES_CATALOG), default=None)
+    p_char.add_argument(
+        "--accessory", dest="accessory_id", choices=sorted(ACCESSORY_CATALOG), default="accessory_none"
+    )
+    p_char.add_argument(
+        "--expression", dest="expression_id", choices=sorted(EXPRESSION_CATALOG), default="expr_neutral"
+    )
+    p_char.add_argument("--action", choices=sorted(ACTION_CATALOG), default="action_idle")
+    p_char.add_argument("--facing", default="front", choices=["front", "side", "back", "three-quarter"])
+    p_char.add_argument(
+        "--size",
+        dest="size_key",
+        default="sprite_medium",
+        choices=sorted(SPRITE_SIZE_KEYS),
+        help="Sprite size preset (Form Output size_key)",
+    )
+    p_char.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_char.add_argument("--seed", type=int, default=-1)
+    p_char.add_argument("--out", default="output")
+    p_char.add_argument(
+        "--block",
+        type=int,
+        default=None,
+        help="Pixel block size for pixel_art style. Smaller = more detail retained "
+        "(default: canvas_size // 64). Lower this if the result looks too blocky/low-detail.",
+    )
+    p_char.add_argument("--colors", type=int, default=48, help="Palette size, 2-256")
+    p_char.add_argument(
+        "--raw",
+        dest="save_raw",
+        action="store_true",
+        help="Also save the pre-pixelation image (<name>_raw.png) to check whether a "
+        "bad result comes from the AI generation itself or from the pixel-art post-processing.",
+    )
+    p_char.add_argument(
+        "--animate",
+        action="store_true",
+        help="Generate the action's animation sheet (idle/run/attack) instead of a single pose",
+    )
+    p_char.add_argument("--slice", action="store_true", help="With --animate, also save each frame separately")
+    p_char.add_argument(
+        "--from-layers",
+        action="store_true",
+        help="Ground the animation in the composited PNG layers (base/hair/outfit/shoes/"
+        "accessory from --asset-dir), captioning the actual composited look instead of "
+        "relying on catalog text alone. Only affects --animate.",
+    )
+    p_char.add_argument(
+        "--asset-dir",
+        default="character_assets",
+        help="Folder containing the layer PNG library (<asset-dir>/<category>/<id>.png), "
+        "used with --from-layers or the character-compose command.",
+    )
+    p_char.add_argument(
+        "--web-json",
+        action="store_true",
+        help="Print {'image': base64 data URI, 'metadata': {...}} instead of the normal "
+        "asset JSON, ready for a web frontend to preview/slice without filesystem access.",
+    )
+
+    p_compose = sub.add_parser(
+        "character-compose",
+        help="Ghép layer only (no AI call): composite the base/hair/outfit/shoes/accessory "
+        "PNGs from an asset library into one character image, per a Form Output",
+    )
+    p_compose.add_argument("--form-file", default=None)
+    p_compose.add_argument("--base", dest="base_id", choices=sorted(CHARACTER_BASE_CATALOG), default=None)
+    p_compose.add_argument("--hair", dest="hair_id", choices=sorted(HAIR_CATALOG), default=None)
+    p_compose.add_argument("--outfit", dest="outfit_id", choices=sorted(OUTFIT_CATALOG), default=None)
+    p_compose.add_argument("--shoes", dest="shoes_id", choices=sorted(SHOES_CATALOG), default=None)
+    p_compose.add_argument(
+        "--accessory", dest="accessory_id", choices=sorted(ACCESSORY_CATALOG), default="accessory_none"
+    )
+    p_compose.add_argument(
+        "--size", dest="size_key", default="sprite_medium", choices=sorted(SPRITE_SIZE_KEYS)
+    )
+    p_compose.add_argument("--asset-dir", default="character_assets")
+    p_compose.add_argument("--out", default="output")
+    p_compose.add_argument("--filename", default=None)
+    p_compose.add_argument(
+        "--no-auto-align",
+        dest="auto_align",
+        action="store_false",
+        default=True,
+        help="Disable the bounding-box auto-align heuristic and overlay parts at raw "
+        "full-canvas size/position (use once assets are manually pre-aligned).",
+    )
+
+    p_assets = sub.add_parser(
+        "character-assets",
+        help="One-time batch job: generate the base-body + overlay PNG asset library "
+        "(needs a real API key) into <asset-dir>/<category>/<id>.png",
+    )
+    p_assets.add_argument("--asset-dir", default="character_assets")
+    p_assets.add_argument("--size", dest="size_key", default="sprite_medium", choices=sorted(SPRITE_SIZE_KEYS))
+    p_assets.add_argument(
+        "--overwrite", action="store_true", help="Regenerate files that already exist in --asset-dir"
+    )
+    p_assets.add_argument(
+        "--categories",
+        nargs="+",
+        choices=["base", "hair", "outfit", "shoes", "accessory"],
+        default=None,
+        help="Only (re)generate these categories, e.g. --categories hair outfit accessory --overwrite. "
+        "Default: all 5.",
+    )
+
     args = parser.parse_args()
     studio = GameAssetStudio(
         api_key=os.getenv("POLLINATIONS_API_KEY", ""),
         model=args.model,
-        output_dir=args.out,
+        output_dir=getattr(args, "out", "output"),
+        timeout=args.timeout,
+        retries=args.retries,
     )
 
     if args.command == "background":
@@ -282,6 +426,89 @@ def main() -> None:
             transparent_bg=args.transparent,
             slice_tiles=args.slice,
         )
+    elif args.command == "character":
+        if args.form_file:
+            with open(args.form_file, "r", encoding="utf-8") as fh:
+                form = CharacterFormOutput.from_dict(json.load(fh))
+        else:
+            required = {"base_id": args.base_id, "hair_id": args.hair_id, "outfit_id": args.outfit_id, "shoes_id": args.shoes_id}
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                parser.error(
+                    f"character requires --form-file, or all of {sorted(required)} "
+                    f"(missing: {missing})"
+                )
+            form = CharacterFormOutput(
+                base_id=args.base_id,
+                hair_id=args.hair_id,
+                outfit_id=args.outfit_id,
+                shoes_id=args.shoes_id,
+                accessory_id=args.accessory_id,
+                expression_id=args.expression_id,
+                action=args.action,
+                facing=args.facing,
+                size_key=args.size_key,
+                style=args.style,
+                seed=args.seed,
+            )
+        if args.animate:
+            if args.from_layers:
+                asset = studio.generate_character_animation_from_layers(
+                    form,
+                    asset_dir=args.asset_dir,
+                    slice_frames=args.slice,
+                    block_size=args.block,
+                    colors=args.colors,
+                )
+            else:
+                asset = studio.generate_character_animation(
+                    form, slice_frames=args.slice, block_size=args.block, colors=args.colors
+                )
+        else:
+            asset = studio.generate_character(
+                form, block_size=args.block, colors=args.colors, save_raw=args.save_raw
+            )
+    elif args.command == "character-compose":
+        if args.form_file:
+            with open(args.form_file, "r", encoding="utf-8") as fh:
+                form = CharacterFormOutput.from_dict(json.load(fh))
+        else:
+            required = {"base_id": args.base_id, "hair_id": args.hair_id, "outfit_id": args.outfit_id, "shoes_id": args.shoes_id}
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                parser.error(
+                    f"character-compose requires --form-file, or all of {sorted(required)} "
+                    f"(missing: {missing})"
+                )
+            form = CharacterFormOutput(
+                base_id=args.base_id,
+                hair_id=args.hair_id,
+                outfit_id=args.outfit_id,
+                shoes_id=args.shoes_id,
+                accessory_id=args.accessory_id,
+                size_key=args.size_key,
+            )
+        try:
+            img = studio.compose_character(form, asset_dir=args.asset_dir, auto_align=args.auto_align)
+        except FileNotFoundError as exc:
+            parser.error(str(exc))
+            return
+        out_name = studio._safe_name(
+            args.filename or f"compose_{form.base_id}_{form.hair_id}_{form.outfit_id}"
+        )
+        path = Path(args.out) / "sprites" / f"{out_name}.png"
+        studio.proc.save(img, path)
+        print(f"\nComposed (no AI call): {path}")
+        return
+    elif args.command == "character-assets":
+        result = studio.generate_character_asset_library(
+            asset_dir=args.asset_dir, size_key=args.size_key, overwrite=args.overwrite,
+            categories=args.categories,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        total = sum(len(v) for v in result.values())
+        print(f"\n{total} asset file(s) under {args.asset_dir}/")
+        return
     else:
         parser.error(f"Unknown command: {args.command}")
         return
