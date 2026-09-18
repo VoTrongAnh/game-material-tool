@@ -28,6 +28,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from PIL import UnidentifiedImageError
 
 from asset_generator import (
     ACCESSORY_CATALOG,
@@ -119,6 +120,7 @@ def create_app(studio: GameAssetStudio | None = None) -> FastAPI:
     def compose_character(
         payload: CharacterFormRequest,
         asset_dir: str = os.getenv("CHARACTER_ASSET_DIR", "character_assets"),
+        auto_align: bool = True,
         studio: GameAssetStudio = Depends(get_studio),
     ) -> dict:
         """Ghép layer only — no AI call, instant. Composites the base/hair/outfit/
@@ -134,11 +136,16 @@ def create_app(studio: GameAssetStudio | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         try:
-            img = studio.compose_character(form, asset_dir=asset_dir)
+            img = studio.compose_character(form, asset_dir=asset_dir, auto_align=auto_align)
         except FileNotFoundError as exc:
             # Missing asset file(s) -> tell the caller exactly which ones, so a
             # gap in the AI-delivered library is obvious instead of a vague 500.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (UnidentifiedImageError, OSError) as exc:
+            # File exists but isn't a valid image (corrupt/truncated/wrong format)
+            # -> distinct from "missing", since the fix is different (re-generate
+            # or re-upload that one file, not point the path somewhere else).
+            raise HTTPException(status_code=422, detail=f"unreadable asset file: {exc}") from exc
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -182,6 +189,8 @@ def create_app(studio: GameAssetStudio | None = None) -> FastAPI:
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (UnidentifiedImageError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=f"unreadable asset file: {exc}") from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"generation failed: {exc}") from exc
 
