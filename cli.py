@@ -88,7 +88,7 @@ def main() -> None:
         "ReadTimeout/handshake-timeout errors on a slow or restricted network.",
     )
     parser.add_argument(
-        "--retries", type=int, default=3,
+        "--retries", type=int, default=6,
         help="Retry attempts per image-generation request before giving up.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -103,6 +103,13 @@ def main() -> None:
     )
     p_bg.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
     p_bg.add_argument("--time", default="day", choices=["day", "night", "dusk", "dawn"])
+    p_bg.add_argument(
+        "--view-angle",
+        dest="view_angle",
+        default="side_scroll",
+        choices=["side_scroll", "top_down", "front"],
+        help="Camera angle for the game level (default: side_scroll)",
+    )
     p_bg.add_argument("--seed", type=int, default=-1)
     p_bg.add_argument("--out", default="output")
 
@@ -116,7 +123,8 @@ def main() -> None:
     )
     p_sp.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
     p_sp.add_argument("--facing", default="front", choices=["front", "side", "back", "three-quarter"])
-    p_sp.add_argument("--transparent", action="store_true")
+    p_sp.add_argument("--transparent", dest="transparent", action="store_true", default=True)
+    p_sp.add_argument("--no-transparent", dest="transparent", action="store_false")
     p_sp.add_argument("--seed", type=int, default=-1)
     p_sp.add_argument("--out", default="output")
 
@@ -130,6 +138,7 @@ def main() -> None:
     )
     p_px.add_argument("--block", type=int, default=8, help="Pixel block size, e.g. 4-16")
     p_px.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
+    p_px.add_argument("--no-transparent", dest="transparent", action="store_false", default=True)
     p_px.add_argument("--seed", type=int, default=-1)
     p_px.add_argument("--out", default="output")
 
@@ -143,6 +152,7 @@ def main() -> None:
     )
     p_px_img.add_argument("--block", type=int, default=8, help="Pixel block size, e.g. 4-16")
     p_px_img.add_argument("--colors", type=int, default=32, help="Palette size, 2-256")
+    p_px_img.add_argument("--transparent", action="store_true", default=False)
     p_px_img.add_argument("--out", default="output")
 
     p_sp_img = sub.add_parser(
@@ -183,12 +193,30 @@ def main() -> None:
     p_ts.add_argument("--frame-height", type=int, default=64)
     p_ts.add_argument("--seed", type=int, default=-1)
     p_ts.add_argument("--slice", action="store_true", help="Also save each frame separately")
+    p_ts.add_argument("--reference", default=None, help="Optional reference image path to anchor character identity")
+    p_ts.add_argument("--skip-caption", action="store_true", help="Skip character identity captioning")
     p_ts.add_argument("--out", default="output")
     p_ts.add_argument(
         "--web-json",
         action="store_true",
         help="Print {'image': base64 data URI, 'metadata': {...}} instead of the normal "
         "asset JSON, ready for a web frontend to preview/slice without filesystem access.",
+    )
+
+    p_ps = sub.add_parser("pose-sheet", help="Generate an 8-pose character keyframe sheet (idle, walk, attack, jump, hurt, death)")
+    p_ps.add_argument("subject", help="Character description, e.g. 'fire mage'")
+    p_ps.add_argument("--style", default="pixel_art", choices=STYLE_CHOICES)
+    p_ps.add_argument("--frame-width", type=int, default=64)
+    p_ps.add_argument("--frame-height", type=int, default=64)
+    p_ps.add_argument("--seed", type=int, default=-1)
+    p_ps.add_argument("--slice", action="store_true", help="Also save each pose frame separately")
+    p_ps.add_argument("--reference", default=None, help="Optional reference image path to anchor character identity")
+    p_ps.add_argument("--skip-caption", action="store_true", help="Skip character identity captioning")
+    p_ps.add_argument("--out", default="output")
+    p_ps.add_argument(
+        "--web-json",
+        action="store_true",
+        help="Print {'image': base64 data URI, 'metadata': {...}} instead of the normal JSON.",
     )
 
     p_tset = sub.add_parser(
@@ -366,6 +394,7 @@ def main() -> None:
             style=args.style,
             time_of_day=args.time,
             seed=args.seed,
+            view_angle=args.view_angle,
         )
     elif args.command == "sprite":
         asset = studio.generate_sprite(
@@ -383,6 +412,7 @@ def main() -> None:
             block_size=args.block,
             colors=args.colors,
             seed=args.seed,
+            transparent_bg=args.transparent,
         )
     elif args.command == "pixel-from-image":
         asset = studio.convert_image_to_pixel_art(
@@ -390,6 +420,7 @@ def main() -> None:
             size_key=args.size,
             block_size=args.block,
             colors=args.colors,
+            transparent_bg=args.transparent,
         )
     elif args.command == "sprite-from-image":
         asset = studio.generate_sprite_from_image(
@@ -410,6 +441,18 @@ def main() -> None:
             slice_frames=args.slice,
             frame_size=(args.frame_width, args.frame_height),
             action=args.action,
+            reference_image=args.reference,
+            skip_caption=args.skip_caption,
+        )
+    elif args.command == "pose-sheet":
+        asset = studio.generate_pose_sheet(
+            subject=args.subject,
+            style=args.style,
+            seed=args.seed,
+            slice_frames=args.slice,
+            frame_size=(args.frame_width, args.frame_height),
+            reference_image=args.reference,
+            skip_caption=args.skip_caption,
         )
     elif args.command == "tileset":
         if not args.tiles and not args.preset:

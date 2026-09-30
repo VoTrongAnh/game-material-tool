@@ -28,6 +28,25 @@ import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 
+def _load_dotenv_if_present() -> None:
+    for env_path in (Path(".env"), Path(__file__).resolve().parent / ".env"):
+        if env_path.is_file():
+            try:
+                for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+            except OSError:
+                pass
+
+
+_load_dotenv_if_present()
+
 POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/image"
 POLLINATIONS_TEXT_URL = "https://gen.pollinations.ai/v1/chat/completions"
 API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
@@ -185,9 +204,81 @@ EXPRESSION_CATALOG: dict[str, str] = {
 # frame count + per-frame pose hint, matched to the Web team's Idle/Run/
 # Attack preview module.
 ACTION_CATALOG: dict[str, dict[str, Any]] = {
-    "action_idle": {"label": "idle", "frames": 4, "pose": "idle breathing animation"},
-    "action_run": {"label": "running", "frames": 8, "pose": "running cycle animation"},
-    "action_attack": {"label": "attacking", "frames": 6, "pose": "attack swing animation"},
+    "action_idle": {
+        "label": "idle",
+        "frames": 4,
+        "pose": "idle breathing animation",
+        "frame_poses": [
+            "upright neutral idle stance, arms relaxed at sides, balanced posture",
+            "idle breathing inhale pose, chest slightly raised, alert expression",
+            "upright neutral idle stance, weapon or hands steady, clean silhouette",
+            "idle breathing exhale pose, knees slightly softened, relaxed shoulders",
+        ],
+    },
+    "action_run": {
+        "label": "running",
+        "frames": 8,
+        "pose": "running cycle animation",
+        "frame_poses": [
+            "run cycle contact pose, left leg extended forward, right leg back, right arm forward",
+            "run cycle down pose, front left knee bent absorbing impact, torso leaning slightly forward",
+            "run cycle passing pose, legs crossing directly under torso, arms close to waist",
+            "run cycle push-off pose, left leg pushing off behind, right knee driving high forward",
+            "run cycle contact pose, right leg extended forward, left leg back, left arm forward",
+            "run cycle down pose, front right knee bent absorbing impact, torso leaning slightly forward",
+            "run cycle passing pose, legs crossing directly under torso, balanced mid-stride",
+            "run cycle push-off pose, right leg pushing off behind, left knee driving high forward",
+        ],
+    },
+    "action_attack": {
+        "label": "attacking",
+        "frames": 6,
+        "pose": "attack swing animation",
+        "frame_poses": [
+            "combat ready guard stance, weapon poised at side",
+            "attack wind-up pose, drawing weapon back over shoulder to strike",
+            "fast forward swing motion, torso rotating into the attack",
+            "full extension attack impact pose, lunging forward with weapon extended",
+            "attack follow-through pose, weapon at end of swing arc, wide stance",
+            "recovery pose, returning smoothly to combat guard stance",
+        ],
+    },
+}
+
+# Explicit per-frame pose sequences for generic `generate_tilesheet` actions so
+# AI models draw distinct keyframe silhouettes instead of repeating one pose.
+GENERIC_ACTION_FRAME_POSES: dict[str, list[str]] = {
+    "idle": ACTION_CATALOG["action_idle"]["frame_poses"],
+    "run": ACTION_CATALOG["action_run"]["frame_poses"],
+    "running": ACTION_CATALOG["action_run"]["frame_poses"],
+    "walk": [
+        "walk cycle contact pose, left heel touching ground forward, right foot back, opposite arm swing",
+        "walk cycle recoil pose, weight shifting onto front left leg, knees slightly bent",
+        "walk cycle passing pose, right leg lifting and passing beside standing left leg",
+        "walk cycle high-point pose, body upright at peak height, right leg reaching forward",
+        "walk cycle contact pose, right heel touching ground forward, left foot back, opposite arm swing",
+        "walk cycle recoil pose, weight shifting onto front right leg, knees slightly bent",
+        "walk cycle passing pose, left leg lifting and passing beside standing right leg",
+        "walk cycle high-point pose, body upright at peak height, left leg reaching forward",
+    ],
+    "walking": [
+        "walk cycle contact pose, left heel touching ground forward, right foot back, opposite arm swing",
+        "walk cycle recoil pose, weight shifting onto front left leg, knees slightly bent",
+        "walk cycle passing pose, right leg lifting and passing beside standing left leg",
+        "walk cycle high-point pose, body upright at peak height, right leg reaching forward",
+        "walk cycle contact pose, right heel touching ground forward, left foot back, opposite arm swing",
+        "walk cycle recoil pose, weight shifting onto front right leg, knees slightly bent",
+        "walk cycle passing pose, left leg lifting and passing beside standing right leg",
+        "walk cycle high-point pose, body upright at peak height, left leg reaching forward",
+    ],
+    "attack": ACTION_CATALOG["action_attack"]["frame_poses"],
+    "attacking": ACTION_CATALOG["action_attack"]["frame_poses"],
+    "jump": [
+        "jump crouch preparation pose, knees bent low, arms swung back",
+        "jump launch upward pose, legs fully extended pushing off ground, arms reaching up",
+        "mid-air apex pose, knees tucked slightly in flight, balanced airborne silhouette",
+        "landing impact absorption pose, knees bent on touchdown, arms out for balance",
+    ],
 }
 
 
@@ -262,17 +353,10 @@ class AssetCompositor:
 
     # Per-category (target_height_fraction_of_base, max_width_fraction_of_canvas,
     # vertical_anchor, horizontal_offset_fraction_of_base_width) heuristic.
-    # Height scales against the base body's own height (how big the part should
-    # look relative to this character). The width cap is a safety ceiling against
-    # the full canvas, not the body's own (much narrower) silhouette — a
-    # diagonally-held sword or a flared robe legitimately extends past the torso.
     _ALIGN_RULES: dict[str, tuple[float, float, str, float]] = {
-        "hair": (0.22, 0.55, "top", 0.0),
-        "outfit": (0.58, 0.85, "upper", 0.0),
-        "shoes": (0.14, 0.55, "bottom", 0.0),
-        # A held weapon/item sits at the character's side, not dead-center over
-        # the torso — offset it right by 22% of body width so it doesn't paper
-        # over the outfit.
+        "hair": (0.24, 0.55, "top", 0.0),
+        "outfit": (0.56, 0.82, "upper", 0.0),
+        "shoes": (0.15, 0.52, "bottom", 0.0),
         "accessory": (0.42, 0.70, "center", 0.22),
     }
 
@@ -521,20 +605,57 @@ class PromptOptimizer:
 
     NEGATIVE_BASE = (
         "blurry, watermark, text, logo, signature, extra limbs, bad anatomy, "
-        "low quality, cropped, deformed, noisy"
+        "low quality, cropped, deformed, noisy, checkerboard pattern, transparency grid"
     )
+
+    # Keywords that identify standalone props/decor tiles (which need transparent
+    # backgrounds) versus full-bleed terrain/floor/wall/liquid tiles (which must
+    # fill the entire square cell edge-to-edge for Tiled/GameMaker map painting).
+    _PROP_TILE_KEYWORDS = (
+        "tree", "canopy", "bush", "shrub", "rock boulder", "boulder", "crate",
+        "chest", "torch", "sign", "ladder", "spike", "coin", "flower", "door",
+        "gate", "stairs", "rubble", "barrel", "skull", "stalactite", "stalagmite",
+        "crystal", "mushroom", "pool", "vein",
+    )
+    _TERRAIN_TILE_KEYWORDS = (
+        "ground", "dirt", "grass", "stone", "wall", "floor", "water", "lava",
+        "brick", "plank", "cave floor", "cave wall", "fill",
+    )
+
+    @staticmethod
+    def is_seamless_terrain_tile(subject: str) -> bool:
+        lower = subject.lower()
+        if any(k in lower for k in PromptOptimizer._PROP_TILE_KEYWORDS):
+            return False
+        return any(k in lower for k in PromptOptimizer._TERRAIN_TILE_KEYWORDS)
 
     @staticmethod
     def build_background_prompt(
         subject: str,
         style: str = "pixel_art",
         time_of_day: str = "day",
+        view_angle: str = "side_scroll",
     ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
+        view_specs = {
+            "side_scroll": (
+                "2D side-scrolling platformer game background, flat horizontal walkable "
+                "ground floor along the bottom edge, layered parallax background scenery, "
+                "orthographic 2D side view"
+            ),
+            "top_down": (
+                "90-degree overhead bird's-eye top-down 2D RPG game map background, "
+                "flat playable ground surface, orthographic overhead projection"
+            ),
+            "front": (
+                "2D front-facing game stage background, clear flat foreground floor for "
+                "characters to stand on, balanced stage composition"
+            ),
+        }
+        view_clause = view_specs.get(view_angle, view_specs["side_scroll"])
         return (
-            f"{subject}, {time_of_day} lighting, seamless game background, "
-            f"side-scrolling environment, no characters, no HUD, {style_tag}, "
-            f"wide shot, clean composition"
+            f"{subject}, {time_of_day} lighting, {view_clause}, "
+            f"no characters, no HUD, {style_tag}, wide shot, clean composition"
         )
 
     @staticmethod
@@ -546,7 +667,7 @@ class PromptOptimizer:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
         return (
             f"{subject}, {facing} facing, full body, single centered object, "
-            f"isolated, transparent background if possible, game sprite, "
+            f"isolated on solid white background, no drop shadow, game sprite, "
             f"{style_tag}, clean silhouette, no scenery"
         )
 
@@ -559,28 +680,66 @@ class PromptOptimizer:
         style: str = "pixel_art",
     ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
+        action_key = action.strip().lower()
+        pose_list = GENERIC_ACTION_FRAME_POSES.get(action_key)
+        if pose_list:
+            pose_desc = pose_list[frame_index % len(pose_list)]
+        else:
+            pose_desc = f"{action} animation frame {frame_index + 1} of {frame_count}"
+
         return (
-            f"{subject}, {action} animation frame {frame_index + 1} of {frame_count}, "
-            f"single character pose, centered, same scale, isolated, white or transparent background, "
+            f"{subject}, {pose_desc}, full body, single character pose, centered, "
+            f"same scale, isolated on solid white background, no shadow, "
             f"game sprite animation, {style_tag}, clean silhouette"
+        )
+
+    @staticmethod
+    def build_key_pose_prompt(
+        subject: str,
+        pose: str,
+        style: str = "pixel_art",
+    ) -> str:
+        style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
+        pose_descriptions = {
+            "idle": "upright neutral idle stance, balanced posture, ready expression",
+            "walk_contact": "walking stride pose, left foot forward, right foot back, arms swinging",
+            "walk_passing": "walking mid-step passing pose, one knee lifted passing the standing leg",
+            "attack_windup": "combat wind-up pose, drawing weapon or fist back to prepare a strike",
+            "attack_impact": "dynamic forward attack strike pose, lunging forward at full extension",
+            "jump": "mid-air jump pose, knees tucked upward, dynamic airborne silhouette",
+            "hurt": "hit recoil hurt pose, leaning back in shock, defensive posture",
+            "death": "defeated fallen pose lying flat on the ground",
+        }
+        pose_text = pose_descriptions.get(pose, f"{pose} pose")
+        return (
+            f"single solitary {subject}, {pose_text}, one character only, full body, centered, "
+            f"isolated on solid white background, "
+            f"no shadow, game sprite, {style_tag}, clean silhouette"
         )
 
     @staticmethod
     def build_pixel_art_prompt(subject: str) -> str:
         return (
-            f"{subject}, pure pixel art game asset, 8-bit retro, limited color palette, "
-            f"hard pixel edges, no gradients, clean silhouette, classic NES/SNES style"
+            f"single {subject}, pure pixel art game asset, 8-bit retro, "
+            f"centered, full object visible, isolated on solid white background, "
+            f"limited color palette, hard pixel edges, no gradients, clean silhouette, classic NES style"
         )
 
     @staticmethod
     def build_tile_prompt(subject: str, style: str = "pixel_art") -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
+        if PromptOptimizer.is_seamless_terrain_tile(subject):
+            return (
+                f"seamless repeatable 2D game tile texture of {subject}, "
+                f"fills the entire square frame edge to edge, "
+                f"flat orthographic view, even lighting, tileable edges, "
+                f"no border, no background margin, {style_tag}, clean pixel grid"
+            )
         return (
-            f"single {subject}, one isolated game tile asset for a tileset, "
-            f"square orthographic view, centered, flat even lighting, no drop shadow, "
-            f"no perspective distortion, fills the entire frame edge to edge, "
-            f"tileable/seamless edges, transparent background, {style_tag}, "
-            f"clean pixel grid, no text, no watermark, no ruler, no grid lines"
+            f"single {subject}, isolated game tile prop for a tileset, "
+            f"square orthographic view, centered on solid white background, "
+            f"flat even lighting, no drop shadow, {style_tag}, "
+            f"clean pixel grid, no text, no grid lines"
         )
 
     @staticmethod
@@ -603,7 +762,7 @@ class PromptOptimizer:
         description = ", ".join(p for p in parts if p)
         return (
             f"{description}, {pose}, {form.facing} facing, full body, "
-            f"single centered character, isolated, transparent background, "
+            f"single centered character, isolated on solid white background, "
             f"game sprite, {style_tag}, flat solid colors, no gradients, "
             f"no blur, sharp clean pixel edges, consistent character design, "
             f"clean silhouette, no scenery"
@@ -612,23 +771,20 @@ class PromptOptimizer:
     @staticmethod
     def get_negative_prompt(asset_type: str = "general") -> str:
         extras = {
-            "background": ", characters, people, HUD, UI elements",
-            "sprite": ", background scenery, multiple objects, multiple poses",
-            "sprite_sheet": ", merged frames, uneven spacing, different character scale",
+            "background": ", characters, people, player sprite, HUD, UI elements, text overlay",
+            "sprite": ", background scenery, ground shadow, drop shadow, multiple objects, multiple poses, frame border",
+            "sprite_sheet": ", background scenery, ground shadow, merged characters, multiple characters in one frame, cropped feet",
             "tile": (
-                ", multiple tiles, full tileset, sprite sheet, grid lines, ruler, "
-                "perspective, isometric, drop shadow, background scenery, frame border"
+                ", multiple tiles, full tileset grid, grid lines, ruler, "
+                "3D perspective, isometric, drop shadow, frame border"
             ),
             "character": (
-                ", background scenery, multiple characters, multiple poses, "
-                "gradient shading, dithering noise, jpeg artifacts, soft edges"
+                ", background scenery, ground shadow, multiple characters, multiple poses, "
+                "gradient shading, dithering noise, jpeg artifacts, soft blurry edges, cropped feet"
             ),
             "isolated_part": (
-                ", person, human, character, body, full figure, torso, arms, legs, "
-                "hands, face, head, skull, portrait, bust, npc, model wearing it, "
-                "worn, wearing, equipped on a character, mannequin with a face, "
-                "holding it, wielding it, scene, background story, environment, "
-                "multiple objects, other characters, inventory grid, item frame, ui border"
+                ", background scenery, inventory grid, item frame, ui border, "
+                "drop shadow, multiple items"
             ),
         }
         return PromptOptimizer.NEGATIVE_BASE + extras.get(asset_type, "")
@@ -638,6 +794,8 @@ class PollinationsProvider:
     """Pollinations image provider adapter."""
 
     name = "pollinations"
+    recommended_delay = 2.0
+    _last_free_call_ts: float = 0.0
 
     def __init__(
         self,
@@ -645,7 +803,7 @@ class PollinationsProvider:
         model: str = "flux",
         base_url: str = POLLINATIONS_BASE_URL,
         timeout: int = 90,
-        retries: int = 3,
+        retries: int = 5,
         private: bool = True,
         enhance: bool = False,
         nologo: bool = True,
@@ -669,29 +827,61 @@ class PollinationsProvider:
         negative_prompt: str | None = None,
     ) -> ProviderResult:
         actual_seed = seed if seed >= 0 else int(time.time() * 1000) % 2_147_483_647
+        use_free_endpoint = not bool(self.api_key) and "gen.pollinations.ai" in self.base_url
+        active_base = "https://image.pollinations.ai/prompt" if use_free_endpoint else self.base_url
+
         full_prompt = prompt
-        if negative_prompt:
+        if negative_prompt and not use_free_endpoint:
             full_prompt = f"{prompt}. Avoid: {negative_prompt}"
 
-        url = f"{self.base_url}/{quote(full_prompt)}"
+        encoded_prompt = quote(full_prompt, safe="")
+
         params: dict[str, Any] = {
-            "model": self.model,
             "width": width,
             "height": height,
             "seed": actual_seed,
         }
+        if not use_free_endpoint:
+            params["model"] = self.model
+            params["private"] = str(self.private).lower()
+            params["enhance"] = str(self.enhance).lower()
+            params["nologo"] = str(self.nologo).lower()
+
         headers: dict[str, str] = {}
         if self.api_key:
-            # Current Pollinations API (gen.pollinations.ai) authenticates via
-            # Bearer header, not query params. nologo/enhance/private query params
-            # were dropped from the current image API (2026-06-10 changelog) so
-            # they're no longer sent here.
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         last_error: Exception | None = None
         for attempt in range(1, self.retries + 1):
             try:
+                if use_free_endpoint:
+                    elapsed = time.time() - PollinationsProvider._last_free_call_ts
+                    if elapsed < 16.0:
+                        time.sleep(16.0 - elapsed)
+                    PollinationsProvider._last_free_call_ts = time.time()
+
+                url = f"{active_base}/{encoded_prompt}"
                 response = requests.get(url, params=params, headers=headers, timeout=self.timeout)
+                if response.status_code in (401, 403) and not use_free_endpoint:
+                    active_base = "https://image.pollinations.ai/prompt"
+                    use_free_endpoint = True
+                    encoded_prompt = quote(prompt, safe="")
+                    params = {"width": width, "height": height, "seed": actual_seed}
+                    url = f"{active_base}/{encoded_prompt}"
+                    PollinationsProvider._last_free_call_ts = time.time()
+                    response = requests.get(url, params=params, timeout=self.timeout)
+
+                if response.status_code in (402, 429, 500, 502, 503, 504):
+                    last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:160]}")
+                    retry_after = response.headers.get("Retry-After")
+                    default_wait = 15 if use_free_endpoint else (6 * attempt)
+                    try:
+                        wait = int(retry_after) if retry_after else default_wait
+                    except ValueError:
+                        wait = default_wait
+                    time.sleep(wait + random.uniform(1.0, 2.5))
+                    continue
+
                 response.raise_for_status()
 
                 content_type = response.headers.get("content-type", "")
@@ -701,6 +891,23 @@ class PollinationsProvider:
 
                 image = Image.open(io.BytesIO(response.content)).convert("RGBA")
                 warnings: list[str] = []
+                if use_free_endpoint and image.width >= 256 and image.height >= 256:
+                    # Only strip the free-tier bottom-right watermark region when the
+                    # image is an isolated sprite on a solid near-white background.
+                    c_tl = image.getpixel((4, 4))[:3]
+                    c_tr = image.getpixel((image.width - 5, 4))[:3]
+                    c_bl = image.getpixel((4, image.height - 5))[:3]
+                    if all(min(c) >= 230 for c in (c_tl, c_tr, c_bl)):
+                        from PIL import ImageDraw
+
+                        draw = ImageDraw.Draw(image)
+                        wm_w = min(200, image.width // 2)
+                        wm_h = min(46, image.height // 6)
+                        draw.rectangle(
+                            [image.width - wm_w, image.height - wm_h, image.width, image.height],
+                            fill=image.getpixel((4, 4)),
+                        )
+
                 if image.size != (width, height):
                     warnings.append(
                         f"Provider returned {image.size[0]}x{image.size[1]} instead of requested {width}x{height}; post-processed locally."
@@ -782,7 +989,6 @@ class PollinationsCaptioner:
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
                 if isinstance(content, list):
-                    # Some OpenAI-compatible backends return content as a list of parts.
                     content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
                 content = (content or "").strip()
                 if not content:
@@ -793,8 +999,6 @@ class PollinationsCaptioner:
                 if attempt < self.retries:
                     time.sleep(2 * attempt)
 
-        # Fail soft: caller falls back to filename-derived subject instead of crashing
-        # the whole pipeline just because captioning is unavailable.
         return CaptionResult(
             description="",
             provider=self.name,
@@ -812,11 +1016,15 @@ class ImageGenerator:
         model: str = "flux",
         provider: AIImageProvider | None = None,
         timeout: int = 90,
-        retries: int = 3,
+        retries: int = 5,
     ):
         self.provider = provider or PollinationsProvider(
             api_key=api_key, model=model, timeout=timeout, retries=retries
         )
+
+    @property
+    def recommended_delay(self) -> float:
+        return getattr(self.provider, "recommended_delay", 0.0)
 
     def generate(
         self,
@@ -855,6 +1063,28 @@ class ImageGenerator:
 class AssetPostProcessor:
     """Post-process images into predictable game asset outputs."""
 
+    _rembg_session: Any = None
+    _rembg_unavailable: bool = False
+
+    @staticmethod
+    def _zero_transparent_rgb(img: Image.Image) -> Image.Image:
+        """Zero out RGB values on fully transparent pixels (alpha == 0) so hidden
+        white background pixels (255, 255, 255, 0) never bleed white/grey halos into
+        adjacent character edges during BOX or LANCZOS downscaling."""
+        img = img.convert("RGBA")
+        r, g, b, a = img.split()
+        mask = a.point(lambda v: 255 if v > 0 else 0)
+        zero = Image.new("L", img.size, 0)
+        return Image.merge(
+            "RGBA",
+            (
+                Image.composite(r, zero, mask),
+                Image.composite(g, zero, mask),
+                Image.composite(b, zero, mask),
+                a,
+            ),
+        )
+
     @staticmethod
     def fit_to_canvas(
         img: Image.Image,
@@ -864,11 +1094,54 @@ class AssetPostProcessor:
         background: tuple[int, int, int, int] = (0, 0, 0, 0),
     ) -> Image.Image:
         """Keep aspect ratio and center image on a fixed-size transparent canvas."""
-        img = img.convert("RGBA")
+        img = AssetPostProcessor._zero_transparent_rgb(img)
         fitted = ImageOps.contain(img, target_size, method=resample)
         canvas = Image.new("RGBA", target_size, background)
         x = (target_size[0] - fitted.width) // 2
         y = (target_size[1] - fitted.height) // 2
+        canvas.alpha_composite(fitted, (x, y))
+        return canvas
+
+    @staticmethod
+    def trim_and_fit_sprite(
+        img: Image.Image,
+        target_size: tuple[int, int],
+        *,
+        fill_ratio: float = 0.90,
+        anchor: str = "bottom",
+        resample: Image.Resampling = Image.Resampling.LANCZOS,
+    ) -> Image.Image:
+        """Auto-crop transparent margins around a sprite so its hitbox is tight and
+        consistent, scale it to `fill_ratio` of the target canvas, and align it:
+        - `anchor='bottom'`: place feet right on a consistent ground baseline near
+          the bottom edge (essential for platformer/top-down characters so they don't
+          float above the ground or jitter between animation frames).
+        - `anchor='center'`: center both axes (ideal for items, coins, chests, icons).
+        """
+        img = AssetPostProcessor._zero_transparent_rgb(img)
+        bbox = img.getchannel("A").getbbox()
+        if not bbox:
+            return Image.new("RGBA", target_size, (0, 0, 0, 0))
+
+        # If the image is completely opaque edge-to-edge (e.g. synthetic test images),
+        # fall back to standard fit_to_canvas.
+        if bbox == (0, 0, img.width, img.height) and img.getextrema()[3][0] == 255:
+            return AssetPostProcessor.fit_to_canvas(img, target_size, resample=resample)
+
+        cropped = img.crop(bbox)
+        cw, ch = target_size
+        usable_w = max(1, round(cw * fill_ratio))
+        usable_h = max(1, round(ch * fill_ratio))
+        fitted = ImageOps.contain(cropped, (usable_w, usable_h), method=resample)
+
+        canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
+        x = (cw - fitted.width) // 2
+        if anchor == "bottom":
+            bottom_pad = max(1, round(ch * 0.03)) if ch >= 32 else 0
+            y = max(0, ch - bottom_pad - fitted.height)
+        else:
+            y = (ch - fitted.height) // 2
+
         canvas.alpha_composite(fitted, (x, y))
         return canvas
 
@@ -906,15 +1179,12 @@ class AssetPostProcessor:
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
 
-        img = img.convert("RGBA")
+        img = AssetPostProcessor._zero_transparent_rgb(img)
+        if block_size == 1:
+            return img
         w, h = img.size
         small_w = max(1, w // block_size)
         small_h = max(1, h // block_size)
-        # BOX (area-average) downscale instead of NEAREST: NEAREST point-samples a
-        # single source pixel per block, which on a soft AI-generated image tends to
-        # grab a stray anti-aliased pixel and produces the "vỡ hạt" (grainy/broken)
-        # look. BOX averages every pixel in the block, so each block's color reflects
-        # what's actually there before we snap it to a hard pixel grid.
         small = img.resize((small_w, small_h), Image.Resampling.BOX)
         return small.resize((w, h), Image.Resampling.NEAREST)
 
@@ -933,19 +1203,78 @@ class AssetPostProcessor:
             dither=dither_mode,
         ).convert("RGBA")
         reduced.putalpha(alpha)
-        return reduced
+        return AssetPostProcessor._zero_transparent_rgb(reduced)
+
+    @staticmethod
+    def unify_frames_palette(frames: list[Image.Image], colors: int = 48) -> list[Image.Image]:
+        """Quantize all frames in an animation sheet against a single shared master
+        palette so character colors never flicker from frame to frame."""
+        if not frames or len(frames) <= 1:
+            return frames
+        colors = max(2, min(256, colors))
+        fw, fh = frames[0].size
+        strip = Image.new("RGB", (fw * len(frames), fh), (0, 0, 0))
+        for idx, frame in enumerate(frames):
+            strip.paste(frame.convert("RGB"), (idx * fw, 0))
+
+        master_palette_img = strip.quantize(
+            colors=colors,
+            method=Image.Quantize.MEDIANCUT,
+            dither=Image.Dither.NONE,
+        )
+        unified: list[Image.Image] = []
+        for frame in frames:
+            rgba = frame.convert("RGBA")
+            alpha = rgba.getchannel("A")
+            quantized_rgb = rgba.convert("RGB").quantize(
+                palette=master_palette_img,
+                dither=Image.Dither.NONE,
+            ).convert("RGBA")
+            quantized_rgb.putalpha(alpha)
+            unified.append(AssetPostProcessor._zero_transparent_rgb(quantized_rgb))
+        return unified
 
     @staticmethod
     def clean_alpha_edges(img: Image.Image, threshold: int = 128) -> Image.Image:
         """Binarize the alpha channel (fully opaque or fully transparent, no
-        in-between). Semi-transparent edge pixels left over from background removal
-        or resampling read as a grey/broken outline once composited into a game —
-        this snaps every pixel to one state or the other for a clean silhouette."""
+        in-between) and zero RGB on transparent pixels to prevent white edge halos."""
         img = img.convert("RGBA")
         alpha = img.getchannel("A").point(lambda a: 255 if a >= threshold else 0)
         cleaned = img.copy()
         cleaned.putalpha(alpha)
-        return cleaned
+        return AssetPostProcessor._zero_transparent_rgb(cleaned)
+
+    @staticmethod
+    def defringe_alpha(img: Image.Image, white_cutoff: int = 232) -> Image.Image:
+        """Remove 1-pixel bright/white background fringe clinging to the outer edge
+        of a cutout sprite before downscaling."""
+        img = AssetPostProcessor.clean_alpha_edges(img, threshold=140)
+        w, h = img.size
+        if w < 64 or h < 64:
+            return img
+        px = img.load()
+        if px is None:
+            return img
+
+        to_clear: list[tuple[int, int]] = []
+        for y in range(1, h - 1):
+            for x in range(1, w - 1):
+                r, g, b, a = px[x, y]
+                if a == 0:
+                    continue
+                # Check if on silhouette boundary (at least one transparent neighbor)
+                if (
+                    px[x - 1, y][3] == 0
+                    or px[x + 1, y][3] == 0
+                    or px[x, y - 1][3] == 0
+                    or px[x, y + 1][3] == 0
+                ):
+                    if r >= white_cutoff and g >= white_cutoff and b >= white_cutoff:
+                        to_clear.append((x, y))
+
+        for x, y in to_clear:
+            px[x, y] = (0, 0, 0, 0)
+        return img
 
     @staticmethod
     def pixelate_clean(
@@ -955,60 +1284,117 @@ class AssetPostProcessor:
         alpha_threshold: int = 128,
         sharpen: bool = True,
     ) -> Image.Image:
-        """End-to-end 'fix the blur, fix the broken pixels' pipeline, in the order
-        that actually matters:
-
-        1. Unsharp-mask the source AI image (it usually arrives a bit soft) so real
-           edges survive the downscale instead of being averaged into mush.
-        2. Downscale to the pixel grid with BOX averaging (see apply_pixel_art_effect).
-        3. Quantize the SMALL image's palette with dithering off (dithering is what
-           produces the speckled/broken look — it scatters noise to fake extra
-           colors, which is the opposite of what a clean retro palette wants).
-        4. Binarize alpha so edges are crisp instead of a grey halo.
-        5. Upscale with NEAREST for hard pixel edges.
-
-        Quantizing the small image (step 3) before the final upscale (step 5) is the
-        key fix versus the old pipeline, which quantized *after* upscaling and let
-        PIL's default dithering run on a full-size image.
+        """End-to-end 'fix the blur, fix the broken pixels' pipeline:
+        1. Zero transparent RGB so background never bleeds into sprite edges.
+        2. Unsharp-mask the source image so edges survive downscaling.
+        3. Downscale to the pixel grid with BOX averaging (if block_size > 1).
+        4. Quantize the palette with dithering off.
+        5. Binarize alpha so edges are crisp instead of a grey halo.
+        6. Upscale with NEAREST for hard pixel edges.
         """
-        img = img.convert("RGBA")
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1")
+
+        img = AssetPostProcessor._zero_transparent_rgb(img)
         if sharpen:
             from PIL import ImageFilter
 
             rgb = img.convert("RGB").filter(
-                ImageFilter.UnsharpMask(radius=2, percent=120, threshold=3)
+                ImageFilter.UnsharpMask(radius=1.8, percent=130, threshold=3)
             )
             img = Image.merge("RGBA", (*rgb.split(), img.getchannel("A")))
 
         w, h = img.size
-        small_w = max(1, w // block_size)
-        small_h = max(1, h // block_size)
-        small = img.resize((small_w, small_h), Image.Resampling.BOX)
-        small = AssetPostProcessor.reduce_palette(small, colors=colors, dither=False)
-        small = AssetPostProcessor.clean_alpha_edges(small, threshold=alpha_threshold)
-        return small.resize((w, h), Image.Resampling.NEAREST)
+        if block_size > 1:
+            small_w = max(1, w // block_size)
+            small_h = max(1, h // block_size)
+            small = img.resize((small_w, small_h), Image.Resampling.BOX)
+            small = AssetPostProcessor.clean_alpha_edges(small, threshold=alpha_threshold)
+            small = AssetPostProcessor.reduce_palette(small, colors=colors, dither=False)
+            return small.resize((w, h), Image.Resampling.NEAREST)
+
+        cleaned = AssetPostProcessor.clean_alpha_edges(img, threshold=alpha_threshold)
+        return AssetPostProcessor.reduce_palette(cleaned, colors=colors, dither=False)
 
     @staticmethod
-    def remove_background(img: Image.Image, threshold: int = 245) -> Image.Image:
-        """Remove background. Use rembg if installed; otherwise fall back to near-white removal."""
+    def remove_background(img: Image.Image, threshold: int = 240) -> Image.Image:
+        """Remove background using a cached rembg session if available, followed by
+        border flood-fill and edge defringing to strip any remaining white corners."""
         img = img.convert("RGBA")
-        try:
-            from rembg import remove  # type: ignore
+        if not AssetPostProcessor._rembg_unavailable:
+            try:
+                from rembg import new_session, remove  # type: ignore
 
-            return remove(img).convert("RGBA")
-        except Exception:
-            return AssetPostProcessor.remove_near_white_background(img, threshold=threshold)
+                if AssetPostProcessor._rembg_session is None:
+                    AssetPostProcessor._rembg_session = new_session("u2net")
+                cutout = remove(img, session=AssetPostProcessor._rembg_session).convert("RGBA")
+                return AssetPostProcessor.defringe_alpha(cutout)
+            except Exception:
+                AssetPostProcessor._rembg_unavailable = True
+
+        cutout = AssetPostProcessor.remove_near_white_background(img, threshold=threshold)
+        return AssetPostProcessor.defringe_alpha(cutout)
 
     @staticmethod
-    def remove_near_white_background(img: Image.Image, threshold: int = 245) -> Image.Image:
+    def remove_near_white_background(img: Image.Image, threshold: int = 240) -> Image.Image:
+        """Border-connected flood-fill removal of near-white / neutral light backgrounds.
+        Unlike global thresholding, this only removes light background pixels reachable
+        from the outer border of the image — preserving white eyes, white beards, white
+        clothing, and bright weapon highlights inside the character silhouette."""
+        from collections import deque
+
         img = img.convert("RGBA")
-        pixels = []
-        for r, g, b, a in img.getdata():
+        w, h = img.size
+        px = img.load()
+        if px is None or w == 0 or h == 0:
+            return img
+
+        # Effective threshold allows slightly off-white AI backgrounds (#DCDCDC..#FFFFFF)
+        eff_threshold = min(threshold, 225)
+
+        def _is_bg_color(r: int, g: int, b: int, a: int) -> bool:
+            if a == 0:
+                return True
             if r >= threshold and g >= threshold and b >= threshold:
-                pixels.append((r, g, b, 0))
-            else:
-                pixels.append((r, g, b, a))
-        img.putdata(pixels)
+                return True
+            # Also catch neutral light grey/off-white backgrounds near the edges
+            min_c = min(r, g, b)
+            max_c = max(r, g, b)
+            return min_c >= eff_threshold and (max_c - min_c) <= 28
+
+        visited = bytearray(w * h)
+        queue: deque[tuple[int, int]] = deque()
+
+        # Seed BFS from all 4 borders
+        for x in range(w):
+            for y in (0, h - 1):
+                r, g, b, a = px[x, y]
+                if _is_bg_color(r, g, b, a):
+                    idx = y * w + x
+                    if not visited[idx]:
+                        visited[idx] = 1
+                        queue.append((x, y))
+        for y in range(1, h - 1):
+            for x in (0, w - 1):
+                r, g, b, a = px[x, y]
+                if _is_bg_color(r, g, b, a):
+                    idx = y * w + x
+                    if not visited[idx]:
+                        visited[idx] = 1
+                        queue.append((x, y))
+
+        while queue:
+            cx, cy = queue.popleft()
+            px[cx, cy] = (0, 0, 0, 0)
+            for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    nidx = ny * w + nx
+                    if not visited[nidx]:
+                        r, g, b, a = px[nx, ny]
+                        if _is_bg_color(r, g, b, a):
+                            visited[nidx] = 1
+                            queue.append((nx, ny))
+
         return img
 
     @staticmethod
@@ -1019,10 +1405,14 @@ class AssetPostProcessor:
         frame_w, frame_h = frame_size
         sheet = Image.new("RGBA", (frame_w * len(frames), frame_h), (0, 0, 0, 0))
         for index, frame in enumerate(frames):
-            normalized = AssetPostProcessor.fit_to_canvas(
-                frame,
-                frame_size,
-                resample=Image.Resampling.NEAREST,
+            normalized = (
+                frame
+                if frame.size == frame_size
+                else AssetPostProcessor.fit_to_canvas(
+                    frame,
+                    frame_size,
+                    resample=Image.Resampling.NEAREST,
+                )
             )
             sheet.alpha_composite(normalized, (index * frame_w, 0))
         return sheet
@@ -1055,10 +1445,14 @@ class AssetPostProcessor:
             row = index // columns
             x = margin + col * (cell_w + spacing)
             y = margin + row * (cell_h + spacing)
-            normalized = AssetPostProcessor.fit_to_canvas(
-                tile,
-                cell_size,
-                resample=Image.Resampling.NEAREST,
+            normalized = (
+                tile
+                if tile.size == cell_size
+                else AssetPostProcessor.fit_to_canvas(
+                    tile,
+                    cell_size,
+                    resample=Image.Resampling.NEAREST,
+                )
             )
             sheet.alpha_composite(normalized, (x, y))
         return sheet
@@ -1113,7 +1507,7 @@ class GameAssetStudio:
         provider: AIImageProvider | None = None,
         captioner: ImageCaptioner | None = None,
         timeout: int = 90,
-        retries: int = 3,
+        retries: int = 6,
     ):
         self.gen = ImageGenerator(api_key=api_key, model=model, provider=provider, timeout=timeout, retries=retries)
         self.proc = AssetPostProcessor()
@@ -1129,9 +1523,10 @@ class GameAssetStudio:
         time_of_day: str = "day",
         seed: int = -1,
         filename: str | None = None,
+        view_angle: str = "side_scroll",
     ) -> GeneratedAsset:
         width, height = resolve_size(size_key, BACKGROUND_SIZE_KEYS, "background")
-        prompt = PromptOptimizer.build_background_prompt(subject, style, time_of_day)
+        prompt = PromptOptimizer.build_background_prompt(subject, style, time_of_day, view_angle=view_angle)
         result = self.gen.generate_with_metadata(
             prompt,
             width=width,
@@ -1140,6 +1535,9 @@ class GameAssetStudio:
             negative_prompt=PromptOptimizer.get_negative_prompt("background"),
         )
         img = self.proc.cover_to_canvas(result.image, (width, height))
+        if style == "pixel_art":
+            bg_block = 2 if min(width, height) >= 512 else 1
+            img = self.proc.pixelate_clean(img, block_size=bg_block, colors=64)
 
         out_name = self._safe_name(filename or f"bg_{subject}_{size_key}")
         path = self.out / "backgrounds" / f"{out_name}.png"
@@ -1167,15 +1565,20 @@ class GameAssetStudio:
         )
 
         img = result.image
+        resample = Image.Resampling.BOX if style == "pixel_art" else Image.Resampling.LANCZOS
         if transparent_bg:
             img = self.proc.remove_background(img)
             img = self.proc.clean_alpha_edges(img)
-        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
+            img = self.proc.trim_and_fit_sprite(
+                img, (width, height), fill_ratio=0.90, anchor="bottom", resample=resample
+            )
+        else:
+            img = self.proc.fit_to_canvas(img, (width, height), resample=resample)
+
         if style == "pixel_art":
-            # Route through the same anti-blur/anti-speckle pipeline used by the
-            # explicit `pixel` command, so every pixel-art sprite is game-ready
-            # (sharp edges, flat palette, clean silhouette) not just pixel_art asset.
-            img = self.proc.pixelate_clean(img, block_size=max(2, min(width, height) // 64), colors=48)
+            # Keep 1:1 pixel resolution on small sprites (<128px) and crisp 2x2 pixel grid on >=128px
+            eff_block = 1 if min(width, height) < 128 else 2
+            img = self.proc.pixelate_clean(img, block_size=eff_block, colors=48)
 
         out_name = self._safe_name(filename or f"sprite_{subject}_{size_key}")
         path = self.out / "sprites" / f"{out_name}.png"
@@ -1190,19 +1593,35 @@ class GameAssetStudio:
         colors: int = 32,
         seed: int = -1,
         filename: str | None = None,
+        transparent_bg: bool = True,
     ) -> GeneratedAsset:
         width, height = resolve_size(size_key, PIXEL_SIZE_KEYS, "pixel art")
         prompt = PromptOptimizer.build_pixel_art_prompt(subject)
+        gen_w, gen_h = max(width, 512), max(height, 512)
         result = self.gen.generate_with_metadata(
             prompt,
-            width=max(width, 512),
-            height=max(height, 512),
+            width=gen_w,
+            height=gen_h,
             seed=seed,
             negative_prompt=PromptOptimizer.get_negative_prompt("sprite"),
         )
 
-        img = self.proc.fit_to_canvas(result.image, (width, height), resample=Image.Resampling.LANCZOS)
-        img = self.proc.pixelate_clean(img, block_size=block_size, colors=colors)
+        img = result.image
+        is_sprite_canvas = size_key != "background_sq" and min(width, height) <= 256
+        if transparent_bg and is_sprite_canvas:
+            img = self.proc.remove_background(img)
+            img = self.proc.clean_alpha_edges(img)
+            img = self.proc.trim_and_fit_sprite(
+                img, (width, height), fill_ratio=0.88, anchor="center", resample=Image.Resampling.BOX
+            )
+        else:
+            img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.BOX)
+
+        # Ensure small canvases (32x32, 64x64, 128x128) keep a readable pixel grid
+        # (at least 32x32 effective cells) rather than collapsing into an 8x8 blob.
+        max_reasonable_block = max(1, min(width, height) // 32)
+        effective_block = min(block_size, max_reasonable_block) if is_sprite_canvas else block_size
+        img = self.proc.pixelate_clean(img, block_size=max(1, effective_block), colors=colors)
 
         out_name = self._safe_name(filename or f"pixel_{subject}_{size_key}")
         path = self.out / "pixel_art" / f"{out_name}.png"
@@ -1216,13 +1635,24 @@ class GameAssetStudio:
         block_size: int = 8,
         colors: int = 32,
         filename: str | None = None,
+        transparent_bg: bool = False,
     ) -> GeneratedAsset:
         """Deterministic local image-to-pixel pipeline for uploaded HD assets."""
         width, height = resolve_size(size_key, PIXEL_SIZE_KEYS, "pixel art")
         source = Path(image_path)
         img = Image.open(source).convert("RGBA")
-        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
-        img = self.proc.pixelate_clean(img, block_size=block_size, colors=colors)
+        if transparent_bg:
+            img = self.proc.remove_background(img)
+            img = self.proc.clean_alpha_edges(img)
+            img = self.proc.trim_and_fit_sprite(
+                img, (width, height), fill_ratio=0.90, anchor="center", resample=Image.Resampling.BOX
+            )
+        else:
+            img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.BOX)
+
+        max_reasonable_block = max(1, min(width, height) // 32) if min(width, height) <= 128 else block_size
+        effective_block = min(block_size, max_reasonable_block)
+        img = self.proc.pixelate_clean(img, block_size=max(1, effective_block), colors=colors)
 
         out_name = self._safe_name(filename or f"pixel_from_{source.stem}_{size_key}")
         path = self.out / "pixel_art" / f"{out_name}.png"
@@ -1249,6 +1679,21 @@ class GameAssetStudio:
         img = Image.open(source).convert("RGB")
         return self.captioner.describe(img, instruction=instruction or DEFAULT_CHARACTER_CAPTION_INSTRUCTION)
 
+    def _resolve_character_identity(
+        self,
+        subject: str,
+        style: str = "pixel_art",
+        seed: int = -1,
+        reference_image: str | Path | None = None,
+    ) -> str:
+        """Anchor character visual identity into a dense description before multi-frame
+        generation so every frame in a sprite sheet / pose sheet shares the same design."""
+        if reference_image:
+            caption = self.describe_reference_image(reference_image)
+            if caption.description:
+                return f"{subject} ({caption.description})"
+        return subject
+
     def generate_sprite_from_image(
         self,
         image_path: str | Path,
@@ -1261,19 +1706,7 @@ class GameAssetStudio:
         extra_details: str | None = None,
         instruction: str | None = None,
     ) -> GeneratedAsset:
-        """Reference-image -> prompt -> sprite pipeline.
-
-        Upload an HD image of a character (e.g. Luffy) and this will:
-          1. Auto-caption the character via a vision model (name/outfit/colors/props).
-          2. Feed that description into the normal sprite prompt builder.
-          3. Generate a brand-new, clean pixel-art sprite of that character, ready to
-             drop straight into GameMaker (transparent bg, isolated, single pose).
-
-        This is different from `convert_image_to_pixel_art`, which only downsamples
-        the pixels of the original image locally; this method regenerates the
-        character from scratch through the image model, so it can fix pose/background/
-        style regardless of what the source photo/render looked like.
-        """
+        """Reference-image -> prompt -> sprite pipeline."""
         source = Path(image_path)
         caption = self.describe_reference_image(source, instruction=instruction)
 
@@ -1308,16 +1741,7 @@ class GameAssetStudio:
         save_raw: bool = False,
     ) -> GeneratedAsset:
         """Generate a single-pose character sprite from a Web Character Customizer
-        Form Output. Validates every part ID against the catalog before spending an
-        API call, then routes through the same anti-blur/anti-speckle pixelate_clean
-        pipeline as `generate_sprite`/`generate_pixel_art` so output is game-ready.
-
-        `block_size` controls pixel-art granularity: smaller = more detail retained
-        (a full-body character with armor/weapon needs finer blocks than an icon).
-        Defaults to canvas_size // 64 if not given. Pass `save_raw=True` to also
-        save the pre-pixelation image (`<name>_raw.png`) for A/B comparison when
-        debugging whether a bad result comes from generation or post-processing.
-        """
+        Form Output."""
         if isinstance(form, dict):
             form = CharacterFormOutput.from_dict(form)
         form.validate()
@@ -1332,9 +1756,12 @@ class GameAssetStudio:
             negative_prompt=PromptOptimizer.get_negative_prompt("character"),
         )
 
+        resample = Image.Resampling.BOX if form.style == "pixel_art" else Image.Resampling.LANCZOS
         img = self.proc.remove_background(result.image)
         img = self.proc.clean_alpha_edges(img)
-        img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
+        img = self.proc.trim_and_fit_sprite(
+            img, (width, height), fill_ratio=0.90, anchor="bottom", resample=resample
+        )
 
         out_name = self._safe_name(
             filename or f"char_{form.base_id}_{form.hair_id}_{form.outfit_id}_{form.size_key}"
@@ -1345,7 +1772,7 @@ class GameAssetStudio:
             self.proc.save(img, raw_path)
 
         if form.style == "pixel_art":
-            effective_block = block_size if block_size is not None else max(2, min(width, height) // 64)
+            effective_block = block_size if block_size is not None else (1 if min(width, height) < 128 else 2)
             img = self.proc.pixelate_clean(img, block_size=effective_block, colors=colors)
 
         path = self.out / "sprites" / f"{out_name}.png"
@@ -1362,13 +1789,15 @@ class GameAssetStudio:
     ) -> GeneratedAsset:
         """Generate the animation sheet for a Form Output's `action` (idle/run/
         attack, per ACTION_CATALOG), keeping the character's parts identical across
-        every frame and sharing one base seed for visual consistency."""
+        every frame, aligning all frames to a shared ground baseline, and unifying
+        the color palette across the whole sheet."""
         if isinstance(form, dict):
             form = CharacterFormOutput.from_dict(form)
         form.validate()
 
         action_spec = ACTION_CATALOG[form.action]
         frames = action_spec["frames"]
+        pose_seq = action_spec.get("frame_poses", [])
         frame_size = ASSET_SIZES[form.size_key] if form.size_key in ASSET_SIZES else resolve_size(
             form.size_key, SPRITE_SIZE_KEYS, "sprite"
         )
@@ -1379,9 +1808,13 @@ class GameAssetStudio:
         model = ""
         base_seed = form.seed if form.seed >= 0 else random.randint(0, 2_147_483_647 - frames)
         used_seed = base_seed
+        resample = Image.Resampling.BOX if form.style == "pixel_art" else Image.Resampling.LANCZOS
 
         for index in range(frames):
-            frame_pose = f"{action_spec['pose']}, frame {index + 1} of {frames}"
+            if pose_seq:
+                frame_pose = pose_seq[index % len(pose_seq)]
+            else:
+                frame_pose = f"{action_spec['pose']}, frame {index + 1} of {frames}"
             prompt = PromptOptimizer.build_character_prompt(form, frame_pose=frame_pose)
             result = self.gen.generate_with_metadata(
                 prompt,
@@ -1396,11 +1829,16 @@ class GameAssetStudio:
 
             frame = self.proc.remove_background(result.image)
             frame = self.proc.clean_alpha_edges(frame)
-            frame = self.proc.fit_to_canvas(frame, frame_size, resample=Image.Resampling.LANCZOS)
+            frame = self.proc.trim_and_fit_sprite(
+                frame, frame_size, fill_ratio=0.88, anchor="bottom", resample=resample
+            )
             if form.style == "pixel_art":
-                effective_block = block_size if block_size is not None else max(2, min(frame_size) // 64)
+                effective_block = block_size if block_size is not None else (1 if min(frame_size) < 128 else 2)
                 frame = self.proc.pixelate_clean(frame, block_size=effective_block, colors=colors)
             generated_frames.append(frame)
+
+        if form.style == "pixel_art":
+            generated_frames = self.proc.unify_frames_palette(generated_frames, colors=colors)
 
         sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
         out_name = self._safe_name(
@@ -1449,18 +1887,7 @@ class GameAssetStudio:
         asset_dir: str | Path = "character_assets",
         auto_align: bool = True,
     ) -> Image.Image:
-        """Ghép layer only — no AI call. Loads the pre-generated base/hair/outfit/
-        shoes/accessory PNGs and alpha-composites them per the Form Output. This is
-        the server-side equivalent of Web's real-time canvas preview: same asset
-        library, same naming convention, deterministic output. Raises
-        FileNotFoundError naming exactly which layer file is missing, so gaps in
-        the AI-delivered asset library are obvious immediately rather than
-        surfacing as a vague generation failure later.
-
-        `auto_align=True` (default) rescales/repositions each part via a bounding-
-        box heuristic since independently-generated parts share no skeleton. Pass
-        False for raw full-canvas overlay (e.g. once assets are manually pre-
-        aligned to the exact same anchor points by an artist)."""
+        """Ghép layer only — no AI call."""
         if isinstance(form, dict):
             form = CharacterFormOutput.from_dict(form)
         form.validate()
@@ -1475,12 +1902,8 @@ class GameAssetStudio:
         block_size: int | None = None,
         colors: int = 48,
     ) -> GeneratedAsset:
-        """The actual 'nhận lựa chọn custom -> ghép layer -> generate animation'
-        endpoint flow: compose the real PNG layers (no AI), caption that composited
-        look with the vision model, then generate the action's animation frames
-        grounded in that caption instead of pure catalog text — so the animation
-        actually matches the specific parts the user picked, not just a generic
-        text description of the category."""
+        """Compose PNG layers, caption the composited character, and generate an
+        animation sheet with consistent ground baseline and unified palette."""
         if isinstance(form, dict):
             form = CharacterFormOutput.from_dict(form)
         form.validate()
@@ -1492,6 +1915,7 @@ class GameAssetStudio:
 
         action_spec = ACTION_CATALOG[form.action]
         frames = action_spec["frames"]
+        pose_seq = action_spec.get("frame_poses", [])
         frame_size = resolve_size(form.size_key, SPRITE_SIZE_KEYS, "sprite")
 
         generated_frames: list[Image.Image] = []
@@ -1499,9 +1923,13 @@ class GameAssetStudio:
         provider_name = ""
         model = ""
         base_seed = form.seed if form.seed >= 0 else random.randint(0, 2_147_483_647 - frames)
+        resample = Image.Resampling.BOX if form.style == "pixel_art" else Image.Resampling.LANCZOS
 
         for index in range(frames):
-            frame_pose = f"{action_spec['pose']}, frame {index + 1} of {frames}"
+            if pose_seq:
+                frame_pose = pose_seq[index % len(pose_seq)]
+            else:
+                frame_pose = f"{action_spec['pose']}, frame {index + 1} of {frames}"
             prompt = (
                 f"[reference character: {caption.description}] "
                 f"{PromptOptimizer.build_character_prompt(form, frame_pose=frame_pose)}"
@@ -1519,11 +1947,16 @@ class GameAssetStudio:
 
             frame = self.proc.remove_background(result.image)
             frame = self.proc.clean_alpha_edges(frame)
-            frame = self.proc.fit_to_canvas(frame, frame_size, resample=Image.Resampling.LANCZOS)
+            frame = self.proc.trim_and_fit_sprite(
+                frame, frame_size, fill_ratio=0.88, anchor="bottom", resample=resample
+            )
             if form.style == "pixel_art":
-                effective_block = block_size if block_size is not None else max(2, min(frame_size) // 64)
+                effective_block = block_size if block_size is not None else (1 if min(frame_size) < 128 else 2)
                 frame = self.proc.pixelate_clean(frame, block_size=effective_block, colors=colors)
             generated_frames.append(frame)
+
+        if form.style == "pixel_art":
+            generated_frames = self.proc.unify_frames_palette(generated_frames, colors=colors)
 
         sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
         out_name = self._safe_name(
@@ -1572,17 +2005,7 @@ class GameAssetStudio:
         overwrite: bool = False,
         categories: list[str] | None = None,
     ) -> dict[str, list[str]]:
-        """One-time batch job: generates the base-body + overlay PNG library from
-        the AI-Team checklist (3-4 base bodies, 4-6 options per part category) and
-        saves them under ``<asset_dir>/<category>/<id>.png`` — the exact layout
-        AssetCompositor/Web's canvas expect. Run this once with a real API key to
-        produce the first draft of the asset library; AI-isolated overlays (hair/
-        outfit/shoes with no body to anchor proportions to) are approximate, so
-        review and align each file before handing the library to Web.
-
-        `categories` restricts the run to a subset (e.g. ["hair", "outfit"]) —
-        useful for regenerating just the categories that came out badly without
-        re-spending API calls on ones that already look right."""
+        """One-time batch job: generates the base-body + overlay PNG library."""
         asset_dir = Path(asset_dir)
         width, height = resolve_size(size_key, SPRITE_SIZE_KEYS, "sprite")
         style_tag = PromptOptimizer.STYLE_TAGS.get("pixel_art", "pixel art")
@@ -1594,16 +2017,12 @@ class GameAssetStudio:
                 return str(out_path)
 
             if part_id == "hair_bald":
-                # "Bald" isn't a hairstyle to isolate — there's nothing to draw, so
-                # asking the model for one just gets a bust/neck sketched in to fill
-                # the frame. Skip generation and ship an empty transparent layer,
-                # same semantics as accessory_none.
                 blank = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                 self.proc.save(blank, out_path)
                 return str(out_path)
 
             prompt = (
-                f"{descriptor}, {extra}, centered, transparent background, "
+                f"{descriptor}, {extra}, centered on a solid pure white background, "
                 f"{style_tag}, flat solid colors, no gradients, sharp clean pixel edges"
             )
             result = self.gen.generate_with_metadata(
@@ -1615,22 +2034,20 @@ class GameAssetStudio:
             )
             img = self.proc.remove_background(result.image)
             img = self.proc.clean_alpha_edges(img)
-            img = self.proc.fit_to_canvas(img, (width, height), resample=Image.Resampling.LANCZOS)
-            block = max(2, min(width, height) // 64)
+            anchor = "bottom" if category == "base" else "center"
+            img = self.proc.trim_and_fit_sprite(
+                img, (width, height), fill_ratio=0.90, anchor=anchor, resample=Image.Resampling.BOX
+            )
+            block = 1 if min(width, height) < 128 else 2
             img = self.proc.pixelate_clean(img, block_size=block, colors=48)
             self.proc.save(img, out_path)
             return str(out_path)
 
-        # Base bodies keep the "character" negative prompt (they're SUPPOSED to be
-        # a person). Every overlay category uses "isolated_part" — a much stronger
-        # negative prompt specifically excluding person/body/face/scene — because
-        # a first pass with only positive-side "no body" phrasing still rendered
-        # full characters/scenes for hair, outfit, and accessory items.
         base_specs = [
             (
                 part_id, descriptor,
-                "plain grey mannequin base body, neutral T-pose, no clothes, no hair, "
-                "blank featureless face, front facing, full body",
+                "plain grey mannequin base body, neutral standing pose, no clothes, no hair, "
+                "blank featureless face, front view, full body from head to feet",
                 "character",
             )
             for part_id, descriptor in CHARACTER_BASE_CATALOG.items()
@@ -1638,29 +2055,20 @@ class GameAssetStudio:
         hair_specs = [
             (
                 part_id, descriptor,
-                "wig icon as seen in a character creator / avatar customization menu, "
-                "hairstyle item icon, no face, no eyes, no nose, no mouth, no skin, "
-                "no neck, no shoulders, no clothing, floating hair shape only on "
-                "transparent background",
+                "2D game avatar hairstyle wig icon, standalone floating hair shape only, "
+                "empty underneath, studio product icon",
                 "isolated_part",
             )
             for part_id, descriptor in HAIR_CATALOG.items()
         ]
-        # Per-item override for outfits that kept rendering a full standing figure
-        # under the generic "flat lay" framing after 2 rounds of retries — a
-        # different photography style (hanging on a rack) for just these stubborn
-        # IDs, rather than risking a global prompt change that could regress the
-        # outfits already working (vest, armor, robe).
         _outfit_overrides = {
             "outfit_casual_hoodie": (
-                "clothing item hanging on a wooden clothes hanger, retail clothing "
-                "store photography, empty hoodie and pants on a hanger, no person, "
-                "no body, no head, no arms, no legs inside the clothes, not worn"
+                "2D RPG inventory equipment icon of an empty hoodie and jeans laid out flat, "
+                "standalone garment item icon, empty collar and sleeves"
             ),
             "outfit_ninja_suit": (
-                "clothing item hanging on a wooden clothes hanger, retail clothing "
-                "store photography, empty ninja suit on a hanger, no person, no body, "
-                "no head, no arms, no legs inside the clothes, not worn"
+                "2D RPG inventory equipment icon of an empty folded ninja tunic and pants, "
+                "standalone garment item icon, empty collar and sleeves"
             ),
         }
         outfit_specs = [
@@ -1668,11 +2076,8 @@ class GameAssetStudio:
                 part_id, descriptor,
                 _outfit_overrides.get(
                     part_id,
-                    "flat lay clothing photography, the garment laid out flat and "
-                    "empty, sleeves and pant legs lying flat with nothing inside "
-                    "them, RPG inventory equipment icon style, no person, no body, "
-                    "no head, no arms, no legs, no hands, not worn, not being worn "
-                    "by anyone",
+                    "2D RPG inventory equipment icon of a standalone garment laid out flat, "
+                    "empty collar and sleeves, product flat-lay icon",
                 ),
                 "isolated_part",
             )
@@ -1681,18 +2086,14 @@ class GameAssetStudio:
         shoes_specs = [
             (
                 part_id, descriptor,
-                "RPG inventory equipment icon of a pair of shoes, item icon as shown "
-                "in a game inventory screen, no feet, no legs, no person",
+                "2D RPG inventory equipment icon of a standalone pair of shoes side by side, "
+                "product icon",
                 "isolated_part",
             )
             for part_id, descriptor in SHOES_CATALOG.items()
         ]
+
         def _strip_action_verb(text: str) -> str:
-            """ACCESSORY_CATALOG descriptors are written for the full-character
-            prompt ('wearing a wide-brimmed hat', 'holding a sword') — reused
-            verbatim here, that verb fights directly against the 'no person, not
-            worn' isolation instruction. Strip it so the asset-library prompt gets
-            just the noun phrase ('a wide-brimmed hat')."""
             for prefix in ("wearing ", "holding ", "carrying "):
                 if text.startswith(prefix):
                     return text[len(prefix):]
@@ -1701,9 +2102,7 @@ class GameAssetStudio:
         accessory_specs = [
             (
                 part_id, _strip_action_verb(descriptor),
-                "RPG inventory item icon, single loot/equipment icon as shown in a "
-                "game inventory screen, the object lying by itself, not held, not worn, "
-                "no hands, no person, no character, no scene, no background story",
+                "2D RPG inventory item icon, single standalone object, product icon",
                 "isolated_part",
             )
             for part_id, descriptor in ACCESSORY_CATALOG.items()
@@ -1739,8 +2138,12 @@ class GameAssetStudio:
         filename: str | None = None,
         frame_size: tuple[int, int] = (64, 64),
         action: str = "running",
+        reference_image: str | Path | None = None,
+        skip_caption: bool = False,
     ) -> GeneratedAsset:
-        """Generate each animation frame, normalize it, then compose a deterministic horizontal sheet."""
+        """Generate each animation frame with explicit anatomical pose prompts,
+        auto-trim and align every frame to a common ground baseline, unify the
+        sheet palette, and compose a horizontal sprite sheet."""
         if frames < 1 or frames > 32:
             raise ValueError("frames must be between 1 and 32")
         if frame_size[0] < 16 or frame_size[1] < 16:
@@ -1750,15 +2153,21 @@ class GameAssetStudio:
         warnings: list[str] = []
         provider_name = ""
         model = ""
-        # Pick ONE base seed for the whole sheet (once, before the loop) so every frame
-        # shares the same visual identity. Each frame then only offsets by +index from
-        # that base -> consistent character/style across frames.
         base_seed = seed if seed >= 0 else random.randint(0, 2_147_483_647 - frames)
         used_seed = base_seed
 
+        character_identity = (
+            subject
+            if skip_caption
+            else self._resolve_character_identity(subject, style, base_seed, reference_image)
+        )
+        resample = Image.Resampling.BOX if style == "pixel_art" else Image.Resampling.LANCZOS
+
         for index in range(frames):
             frame_seed = base_seed + index
-            prompt = PromptOptimizer.build_animation_frame_prompt(subject, action, index, frames, style)
+            prompt = PromptOptimizer.build_animation_frame_prompt(
+                character_identity, action, index, frames, style
+            )
             result = self.gen.generate_with_metadata(
                 prompt,
                 width=max(frame_size[0], 512),
@@ -1772,12 +2181,16 @@ class GameAssetStudio:
 
             frame = self.proc.remove_background(result.image)
             frame = self.proc.clean_alpha_edges(frame)
-            frame = self.proc.fit_to_canvas(frame, frame_size, resample=Image.Resampling.LANCZOS)
+            frame = self.proc.trim_and_fit_sprite(
+                frame, frame_size, fill_ratio=0.88, anchor="bottom", resample=resample
+            )
             if style == "pixel_art":
-                frame = self.proc.pixelate_clean(
-                    frame, block_size=max(2, min(frame_size) // 64), colors=48
-                )
+                eff_block = 1 if min(frame_size) < 128 else 2
+                frame = self.proc.pixelate_clean(frame, block_size=eff_block, colors=48)
             generated_frames.append(frame)
+
+        if style == "pixel_art":
+            generated_frames = self.proc.unify_frames_palette(generated_frames, colors=48)
 
         sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
         out_name = self._safe_name(filename or f"spritesheet_{subject}_{action}_{frames}f")
@@ -1818,6 +2231,112 @@ class GameAssetStudio:
             warnings=warnings,
         )
 
+    def generate_pose_sheet(
+        self,
+        subject: str,
+        style: str = "pixel_art",
+        seed: int = -1,
+        slice_frames: bool = False,
+        filename: str | None = None,
+        frame_size: tuple[int, int] = (64, 64),
+        reference_image: str | Path | None = None,
+        skip_caption: bool = False,
+    ) -> GeneratedAsset:
+        """Generate a sheet of 8 distinct game character key poses (idle, walk,
+        attack, jump, hurt, death) with baseline alignment and unified palette."""
+        if frame_size[0] < 16 or frame_size[1] < 16:
+            raise ValueError("frame_size must be at least 16x16")
+
+        poses = [
+            "idle",
+            "walk_contact",
+            "walk_passing",
+            "attack_windup",
+            "attack_impact",
+            "jump",
+            "hurt",
+            "death",
+        ]
+        base_seed = seed if seed >= 0 else random.randint(0, 2_147_483_647 - len(poses))
+        used_seed = base_seed
+        character_identity = (
+            subject
+            if skip_caption
+            else self._resolve_character_identity(subject, style, base_seed, reference_image)
+        )
+        resample = Image.Resampling.BOX if style == "pixel_art" else Image.Resampling.LANCZOS
+
+        generated_frames: list[Image.Image] = []
+        warnings: list[str] = []
+        provider_name = ""
+        model = ""
+
+        for index, pose in enumerate(poses):
+            frame_seed = base_seed + index
+            prompt = PromptOptimizer.build_key_pose_prompt(character_identity, pose, style)
+            result = self.gen.generate_with_metadata(
+                prompt,
+                width=max(frame_size[0], 512),
+                height=max(frame_size[1], 512),
+                seed=frame_seed,
+                negative_prompt=PromptOptimizer.get_negative_prompt("sprite_sheet"),
+            )
+            provider_name = result.provider
+            model = result.model
+            warnings.extend(result.warnings)
+
+            frame = self.proc.remove_background(result.image)
+            frame = self.proc.clean_alpha_edges(frame)
+            frame = self.proc.trim_and_fit_sprite(
+                frame, frame_size, fill_ratio=0.88, anchor="bottom", resample=resample
+            )
+            if style == "pixel_art":
+                eff_block = 1 if min(frame_size) < 128 else 2
+                frame = self.proc.pixelate_clean(frame, block_size=eff_block, colors=48)
+            generated_frames.append(frame)
+
+        if style == "pixel_art":
+            generated_frames = self.proc.unify_frames_palette(generated_frames, colors=48)
+
+        sheet = self.proc.compose_sprite_sheet(generated_frames, frame_size)
+        out_name = self._safe_name(filename or f"posesheet_{subject}_{len(poses)}poses")
+        path = self.out / "tilesheets" / f"{out_name}.png"
+        self.proc.save(sheet, path)
+
+        frame_meta: list[FrameMetadata] = []
+        for index, (frame, pose) in enumerate(zip(generated_frames, poses)):
+            frame_path = None
+            if slice_frames:
+                frame_path = self.out / "tilesheets" / out_name / f"{pose}_{index:02d}.png"
+                self.proc.save(frame, frame_path)
+            frame_meta.append(
+                FrameMetadata(
+                    index=index,
+                    x=index * frame_size[0],
+                    y=0,
+                    w=frame_size[0],
+                    h=frame_size[1],
+                    file_path=str(frame_path) if frame_path else None,
+                    name=pose,
+                )
+            )
+
+        return GeneratedAsset(
+            asset_id=str(uuid.uuid4()),
+            asset_type="sprite_sheet",
+            prompt=f"{subject}, key poses, {len(poses)} frames, {style}",
+            provider=provider_name,
+            model=model,
+            seed=used_seed,
+            width=sheet.width,
+            height=sheet.height,
+            format="png",
+            file_path=str(path),
+            has_alpha=True,
+            frames=frame_meta,
+            warnings=warnings,
+        )
+
     def generate_tileset(
         self,
         tiles: list[str] | None = None,
@@ -1832,14 +2351,8 @@ class GameAssetStudio:
         slice_tiles: bool = False,
         filename: str | None = None,
     ) -> GeneratedAsset:
-        """Generate a grid-packed tileset: one distinct tile per subject, normalized
-        to a fixed cell size, composed into a single sheet ready to import as a
-        GameMaker/Tiled tileset (fixed tile_width/tile_height/columns/margin/spacing).
-
-        Also writes a `<name>.json` sidecar next to the PNG describing the grid
-        layout and the name/index/x/y of every tile, so the sheet can be wired up
-        programmatically instead of clicking through each cell by hand.
-        """
+        """Generate a grid-packed tileset: full-bleed seamless square textures for
+        terrain/floor/wall/liquid tiles, and transparent isolated cutouts for props."""
         if preset and not tiles:
             if preset not in TILE_PRESETS:
                 raise ValueError(f"Unknown preset '{preset}'. Valid presets: {sorted(TILE_PRESETS)}")
@@ -1856,6 +2369,7 @@ class GameAssetStudio:
         provider_name = ""
         model = ""
         used_seed = seed
+        resample = Image.Resampling.BOX if style == "pixel_art" else Image.Resampling.LANCZOS
 
         for index, subject in enumerate(tiles):
             tile_seed = seed + index if seed >= 0 else -1
@@ -1874,12 +2388,21 @@ class GameAssetStudio:
             warnings.extend(result.warnings)
 
             img = result.image
-            if transparent_bg:
+            is_terrain = PromptOptimizer.is_seamless_terrain_tile(subject)
+            if is_terrain or not transparent_bg:
+                # Terrain/floor/wall/liquid tiles must fill 100% of the square cell
+                # edge-to-edge so students can paint seamless platforms and maps.
+                img = self.proc.cover_to_canvas(img, (cell_w, cell_h), resample=resample)
+            else:
                 img = self.proc.remove_background(img)
                 img = self.proc.clean_alpha_edges(img)
-            img = self.proc.fit_to_canvas(img, (cell_w, cell_h), resample=Image.Resampling.LANCZOS)
+                img = self.proc.trim_and_fit_sprite(
+                    img, (cell_w, cell_h), fill_ratio=0.90, anchor="bottom", resample=resample
+                )
+
             if style == "pixel_art":
-                img = self.proc.pixelate_clean(img, block_size=max(2, min(cell_w, cell_h) // 16), colors=32)
+                # Keep 1:1 pixel resolution for tiles (16x16..64x64)
+                img = self.proc.pixelate_clean(img, block_size=1, colors=32)
             generated_tiles.append(img)
 
         sheet = self.proc.compose_grid(
