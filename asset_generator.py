@@ -597,15 +597,36 @@ class PromptOptimizer:
     """Build prompts for different game asset types."""
 
     STYLE_TAGS = {
-        "pixel_art": "pixel art, 8-bit, retro game style, crisp hard pixels, no anti-aliasing",
-        "cartoon": "2D cartoon, flat colors, thick outlines, bright palette, game asset",
-        "realistic": "realistic, detailed textures, high quality, game environment",
-        "chibi": "chibi style, cute, rounded shapes, vibrant colors, game sprite",
+        "pixel_art": (
+            "pixel art, 8-bit retro game style, crisp hard-edged pixels, "
+            "no anti-aliasing, no gradients, thin dark 1-pixel outline, "
+            "flat solid color fills, limited color palette, "
+            "consistent pixel grid alignment, clean readable silhouette"
+        ),
+        "cartoon": (
+            "2D cartoon game art, flat cel-shaded colors, bold black outlines, "
+            "bright saturated palette, clean vector-like shapes, "
+            "no realistic shading, game asset illustration style"
+        ),
+        "realistic": (
+            "realistic detailed game art, high quality textures, "
+            "physically-based lighting, rich color depth, "
+            "professional game environment concept art"
+        ),
+        "chibi": (
+            "chibi game sprite, cute super-deformed 2-head-tall proportions, "
+            "oversized round head, tiny body, big expressive eyes, "
+            "vibrant candy colors, thin dark outline, flat shading"
+        ),
     }
 
     NEGATIVE_BASE = (
         "blurry, watermark, text, logo, signature, extra limbs, bad anatomy, "
-        "low quality, cropped, deformed, noisy, checkerboard pattern, transparency grid"
+        "low quality, cropped, deformed, noisy, checkerboard pattern, transparency grid, "
+        "3D rendering, photorealistic, photograph, realistic shading, "
+        "soft airbrush, painterly brush strokes, bokeh, depth of field, motion blur, "
+        "jpeg artifacts, compression artifacts, grainy, out of frame, "
+        "multiple views, model sheet layout, reference sheet grid"
     )
 
     # Keywords that identify standalone props/decor tiles (which need transparent
@@ -641,21 +662,25 @@ class PromptOptimizer:
             "side_scroll": (
                 "2D side-scrolling platformer game background, flat horizontal walkable "
                 "ground floor along the bottom edge, layered parallax background scenery, "
+                "clear depth layers foreground midground background, "
                 "orthographic 2D side view"
             ),
             "top_down": (
                 "90-degree overhead bird's-eye top-down 2D RPG game map background, "
-                "flat playable ground surface, orthographic overhead projection"
+                "flat playable ground surface filling the frame, "
+                "orthographic overhead projection, no horizon line"
             ),
             "front": (
                 "2D front-facing game stage background, clear flat foreground floor for "
-                "characters to stand on, balanced stage composition"
+                "characters to stand on, balanced symmetrical stage composition"
             ),
         }
         view_clause = view_specs.get(view_angle, view_specs["side_scroll"])
         return (
             f"{subject}, {time_of_day} lighting, {view_clause}, "
-            f"no characters, no HUD, {style_tag}, wide shot, clean composition"
+            f"rich environmental detail, atmospheric depth, "
+            f"no characters, no player sprites, no HUD, no UI elements, "
+            f"{style_tag}, wide establishing shot, clean composition"
         )
 
     @staticmethod
@@ -666,9 +691,11 @@ class PromptOptimizer:
     ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
         return (
-            f"{subject}, {facing} facing, full body, single centered object, "
-            f"isolated on solid white background, no drop shadow, game sprite, "
-            f"{style_tag}, clean silhouette, no scenery"
+            f"single {subject}, {facing} facing, full body head to feet, "
+            f"single centered character, isolated on solid pure white background, "
+            f"no drop shadow, no ground shadow, game sprite, "
+            f"consistent proportions, even flat lighting from top-left, "
+            f"{style_tag}, clean silhouette, no scenery, no background elements"
         )
 
     @staticmethod
@@ -688,9 +715,13 @@ class PromptOptimizer:
             pose_desc = f"{action} animation frame {frame_index + 1} of {frame_count}"
 
         return (
-            f"{subject}, {pose_desc}, full body, single character pose, centered, "
-            f"same scale, isolated on solid white background, no shadow, "
-            f"game sprite animation, {style_tag}, clean silhouette"
+            f"single solitary {subject}, {pose_desc}, "
+            f"full body head to feet, single character pose, centered, "
+            f"identical character design throughout all frames, "
+            f"same exact outfit colors, same body proportions, same scale, "
+            f"isolated on solid pure white background, no shadow, "
+            f"even flat lighting from top-left, "
+            f"game sprite animation frame, {style_tag}, clean silhouette"
         )
 
     @staticmethod
@@ -701,28 +732,34 @@ class PromptOptimizer:
     ) -> str:
         style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
         pose_descriptions = {
-            "idle": "upright neutral idle stance, balanced posture, ready expression",
-            "walk_contact": "walking stride pose, left foot forward, right foot back, arms swinging",
-            "walk_passing": "walking mid-step passing pose, one knee lifted passing the standing leg",
-            "attack_windup": "combat wind-up pose, drawing weapon or fist back to prepare a strike",
-            "attack_impact": "dynamic forward attack strike pose, lunging forward at full extension",
-            "jump": "mid-air jump pose, knees tucked upward, dynamic airborne silhouette",
-            "hurt": "hit recoil hurt pose, leaning back in shock, defensive posture",
-            "death": "defeated fallen pose lying flat on the ground",
+            "idle": "upright neutral idle stance, balanced posture, arms relaxed at sides, ready expression",
+            "walk_contact": "walking stride pose, left foot forward heel down, right foot back toe pushing, opposite arm swing",
+            "walk_passing": "walking mid-step passing pose, one knee lifted passing the standing leg, balanced weight",
+            "attack_windup": "combat wind-up pose, torso rotated back, drawing weapon or fist back to prepare a powerful strike",
+            "attack_impact": "dynamic forward attack strike pose, lunging forward at full extension, weapon or fist reaching maximum reach",
+            "jump": "mid-air jump pose, knees tucked upward, arms raised, dynamic airborne silhouette",
+            "hurt": "hit recoil hurt pose, leaning back in shock, one arm guarding, pained expression",
+            "death": "defeated fallen pose lying flat on the ground, limbs spread, eyes closed",
         }
         pose_text = pose_descriptions.get(pose, f"{pose} pose")
         return (
-            f"single solitary {subject}, {pose_text}, one character only, full body, centered, "
-            f"isolated on solid white background, "
-            f"no shadow, game sprite, {style_tag}, clean silhouette"
+            f"single solitary {subject}, {pose_text}, one character only, "
+            f"full body head to feet, centered on canvas, "
+            f"identical character design, same outfit colors, same proportions, "
+            f"isolated on solid pure white background, "
+            f"no shadow, even flat lighting from top-left, "
+            f"game sprite, {style_tag}, clean silhouette"
         )
 
     @staticmethod
     def build_pixel_art_prompt(subject: str) -> str:
         return (
-            f"single {subject}, pure pixel art game asset, 8-bit retro, "
-            f"centered, full object visible, isolated on solid white background, "
-            f"limited color palette, hard pixel edges, no gradients, clean silhouette, classic NES style"
+            f"single {subject}, pure pixel art game asset, 8-bit retro style, "
+            f"centered, full object visible, isolated on solid pure white background, "
+            f"limited 16-color palette, hard pixel edges, no gradients, no anti-aliasing, "
+            f"thin dark 1-pixel outline, flat solid color fills, "
+            f"clean readable silhouette, classic NES sprite style, "
+            f"even flat lighting, no drop shadow"
         )
 
     @staticmethod
@@ -731,15 +768,18 @@ class PromptOptimizer:
         if PromptOptimizer.is_seamless_terrain_tile(subject):
             return (
                 f"seamless repeatable 2D game tile texture of {subject}, "
-                f"fills the entire square frame edge to edge, "
-                f"flat orthographic view, even lighting, tileable edges, "
-                f"no border, no background margin, {style_tag}, clean pixel grid"
+                f"fills the entire square frame edge to edge with no margin, "
+                f"perfectly tileable edges that connect seamlessly when repeated, "
+                f"flat orthographic top-down view, even ambient lighting, "
+                f"no border, no background margin, no perspective distortion, "
+                f"{style_tag}, clean pixel grid"
             )
         return (
-            f"single {subject}, isolated game tile prop for a tileset, "
-            f"square orthographic view, centered on solid white background, "
-            f"flat even lighting, no drop shadow, {style_tag}, "
-            f"clean pixel grid, no text, no grid lines"
+            f"single {subject}, isolated game tile prop for a 2D tileset, "
+            f"square orthographic view, centered on solid pure white background, "
+            f"flat even lighting from top-left, no drop shadow, no ground shadow, "
+            f"complete object fully visible within frame, "
+            f"{style_tag}, clean pixel grid, no text, no grid lines"
         )
 
     @staticmethod
@@ -761,30 +801,49 @@ class PromptOptimizer:
         pose = frame_pose or ACTION_CATALOG[form.action]["pose"]
         description = ", ".join(p for p in parts if p)
         return (
-            f"{description}, {pose}, {form.facing} facing, full body, "
-            f"single centered character, isolated on solid white background, "
+            f"single solitary {description}, {pose}, {form.facing} facing, "
+            f"full body head to feet, single centered character, "
+            f"isolated on solid pure white background, "
+            f"identical character design, same outfit colors, same proportions, "
             f"game sprite, {style_tag}, flat solid colors, no gradients, "
-            f"no blur, sharp clean pixel edges, consistent character design, "
-            f"clean silhouette, no scenery"
+            f"no blur, sharp clean pixel edges, no anti-aliasing, "
+            f"even flat lighting from top-left, "
+            f"clean silhouette, no scenery, no background elements"
         )
 
     @staticmethod
     def get_negative_prompt(asset_type: str = "general") -> str:
         extras = {
-            "background": ", characters, people, player sprite, HUD, UI elements, text overlay",
-            "sprite": ", background scenery, ground shadow, drop shadow, multiple objects, multiple poses, frame border",
-            "sprite_sheet": ", background scenery, ground shadow, merged characters, multiple characters in one frame, cropped feet",
+            "background": (
+                ", characters, people, player sprite, HUD, UI elements, text overlay, "
+                "menu buttons, health bar, score display"
+            ),
+            "sprite": (
+                ", background scenery, ground shadow, drop shadow, multiple objects, "
+                "multiple poses, frame border, gradient shading, soft edges, "
+                "multiple characters, two characters"
+            ),
+            "sprite_sheet": (
+                ", background scenery, ground shadow, merged characters, "
+                "multiple characters in one frame, cropped feet, cropped head, "
+                "inconsistent proportions between frames, different character designs, "
+                "gradient shading, soft anti-aliased edges"
+            ),
             "tile": (
                 ", multiple tiles, full tileset grid, grid lines, ruler, "
-                "3D perspective, isometric, drop shadow, frame border"
+                "3D perspective, isometric view, drop shadow, frame border, "
+                "text label, number overlay, perspective distortion"
             ),
             "character": (
                 ", background scenery, ground shadow, multiple characters, multiple poses, "
-                "gradient shading, dithering noise, jpeg artifacts, soft blurry edges, cropped feet"
+                "gradient shading, dithering noise, jpeg artifacts, soft blurry edges, "
+                "cropped feet, cropped head, inconsistent design, "
+                "different outfit between frames, changing hair color, "
+                "realistic proportions in pixel art, anti-aliased edges"
             ),
             "isolated_part": (
                 ", background scenery, inventory grid, item frame, ui border, "
-                "drop shadow, multiple items"
+                "drop shadow, multiple items, gradient shading"
             ),
         }
         return PromptOptimizer.NEGATIVE_BASE + extras.get(asset_type, "")
@@ -1687,11 +1746,41 @@ class GameAssetStudio:
         reference_image: str | Path | None = None,
     ) -> str:
         """Anchor character visual identity into a dense description before multi-frame
-        generation so every frame in a sprite sheet / pose sheet shares the same design."""
+        generation so every frame in a sprite sheet / pose sheet shares the same design.
+
+        Strategy: generate one reference frame (idle, front-facing), caption it with the
+        vision model, and return a combined subject + caption string that locks the
+        character's appearance for all subsequent frame prompts."""
         if reference_image:
             caption = self.describe_reference_image(reference_image)
             if caption.description:
                 return f"{subject} ({caption.description})"
+
+        # Generate a reference idle frame and caption it for identity anchoring
+        try:
+            style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
+            ref_prompt = (
+                f"single solitary {subject}, upright neutral idle stance facing front, "
+                f"full body head to feet, centered, "
+                f"isolated on solid pure white background, no shadow, "
+                f"game sprite character design reference, {style_tag}"
+            )
+            ref_result = self.gen.generate_with_metadata(
+                ref_prompt,
+                width=512,
+                height=512,
+                seed=seed,
+                negative_prompt=PromptOptimizer.get_negative_prompt("character"),
+            )
+            caption = self.captioner.describe(
+                ref_result.image.convert("RGB"),
+                instruction=DEFAULT_CHARACTER_CAPTION_INSTRUCTION,
+            )
+            if caption.description:
+                return f"{subject} ({caption.description})"
+        except Exception:
+            pass  # captioning failed — fall back to raw subject
+
         return subject
 
     def generate_sprite_from_image(
@@ -2404,6 +2493,10 @@ class GameAssetStudio:
                 # Keep 1:1 pixel resolution for tiles (16x16..64x64)
                 img = self.proc.pixelate_clean(img, block_size=1, colors=32)
             generated_tiles.append(img)
+
+        # Unify palette across all tiles for visual consistency within the tileset
+        if style == "pixel_art" and len(generated_tiles) > 1:
+            generated_tiles = self.proc.unify_frames_palette(generated_tiles, colors=32)
 
         sheet = self.proc.compose_grid(
             generated_tiles,
