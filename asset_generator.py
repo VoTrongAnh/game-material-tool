@@ -1746,41 +1746,11 @@ class GameAssetStudio:
         reference_image: str | Path | None = None,
     ) -> str:
         """Anchor character visual identity into a dense description before multi-frame
-        generation so every frame in a sprite sheet / pose sheet shares the same design.
-
-        Strategy: generate one reference frame (idle, front-facing), caption it with the
-        vision model, and return a combined subject + caption string that locks the
-        character's appearance for all subsequent frame prompts."""
+        generation so every frame in a sprite sheet / pose sheet shares the same design."""
         if reference_image:
             caption = self.describe_reference_image(reference_image)
             if caption.description:
                 return f"{subject} ({caption.description})"
-
-        # Generate a reference idle frame and caption it for identity anchoring
-        try:
-            style_tag = PromptOptimizer.STYLE_TAGS.get(style, style)
-            ref_prompt = (
-                f"single solitary {subject}, upright neutral idle stance facing front, "
-                f"full body head to feet, centered, "
-                f"isolated on solid pure white background, no shadow, "
-                f"game sprite character design reference, {style_tag}"
-            )
-            ref_result = self.gen.generate_with_metadata(
-                ref_prompt,
-                width=512,
-                height=512,
-                seed=seed,
-                negative_prompt=PromptOptimizer.get_negative_prompt("character"),
-            )
-            caption = self.captioner.describe(
-                ref_result.image.convert("RGB"),
-                instruction=DEFAULT_CHARACTER_CAPTION_INSTRUCTION,
-            )
-            if caption.description:
-                return f"{subject} ({caption.description})"
-        except Exception:
-            pass  # captioning failed — fall back to raw subject
-
         return subject
 
     def generate_sprite_from_image(
