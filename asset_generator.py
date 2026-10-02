@@ -1294,6 +1294,149 @@ class AssetPostProcessor:
         return unified
 
     @staticmethod
+    def match_frames_colors(frames: list[Image.Image]) -> list[Image.Image]:
+        """Match the average color distribution of all frames to frame 0 (the reference).
+
+        For each channel (R, G, B), compute the mean of opaque pixels in frame 0,
+        then shift every other frame's opaque pixels so their channel means match.
+        This corrects for Flux generating the same character with subtly different
+        overall brightness/hue per frame — e.g. frame 0's armor is dark grey but
+        frame 3's armor drifts toward brown."""
+        if not frames or len(frames) <= 1:
+            return frames
+
+        ref = frames[0].convert("RGBA")
+        ref_px = ref.load()
+        rw, rh = ref.size
+
+        # Compute per-channel mean of opaque pixels in frame 0
+        ref_sums = [0, 0, 0]
+        ref_count = 0
+        for y in range(rh):
+            for x in range(rw):
+                r, g, b, a = ref_px[x, y]
+                if a > 0:
+                    ref_sums[0] += r
+                    ref_sums[1] += g
+                    ref_sums[2] += b
+                    ref_count += 1
+        if ref_count == 0:
+            return frames
+        ref_means = [s / ref_count for s in ref_sums]
+
+        result = [frames[0]]
+        for frame in frames[1:]:
+            img = frame.convert("RGBA")
+            px = img.load()
+            w, h = img.size
+
+            # Compute this frame's opaque pixel means
+            sums = [0, 0, 0]
+            count = 0
+            for y in range(h):
+                for x in range(w):
+                    r, g, b, a = px[x, y]
+                    if a > 0:
+                        sums[0] += r
+                        sums[1] += g
+                        sums[2] += b
+                        count += 1
+            if count == 0:
+                result.append(frame)
+                continue
+
+            means = [s / count for s in sums]
+            shifts = [ref_means[c] - means[c] for c in range(3)]
+
+            # Skip if shift is negligible
+            if all(abs(s) < 3.0 for s in shifts):
+                result.append(frame)
+                continue
+
+            # Apply shift to opaque pixels
+            for y in range(h):
+                for x in range(w):
+                    r, g, b, a = px[x, y]
+                    if a > 0:
+                        px[x, y] = (
+                            max(0, min(255, round(r + shifts[0]))),
+                            max(0, min(255, round(g + shifts[1]))),
+                            max(0, min(255, round(b + shifts[2]))),
+                            a,
+                        )
+            result.append(img)
+        return result
+
+    @staticmethod
+    def normalize_frame_sizes(
+        frames: list[Image.Image],
+        target_size: tuple[int, int],
+        *,
+        fill_ratio: float = 0.88,
+        anchor: str = "bottom",
+        resample: Image.Resampling = Image.Resampling.BOX,
+    ) -> list[Image.Image]:
+        """Normalize all frames so the character occupies a consistent proportion
+        of the canvas.  Finds the median content height across all frames and
+        re-scales any frame that deviates by more than 15% from that median, then
+        re-aligns to the ground baseline.  This prevents the jarring size jumps
+        that occur when Flux draws the character at wildly different scales in
+        different pose frames."""
+        if not frames or len(frames) <= 1:
+            return frames
+
+        # Measure content height of each frame's opaque region
+        content_heights: list[int] = []
+        bboxes: list[tuple[int, int, int, int] | None] = []
+        for frame in frames:
+            bbox = frame.getchannel("A").getbbox()
+            bboxes.append(bbox)
+            content_heights.append((bbox[3] - bbox[1]) if bbox else 0)
+
+        if not any(h > 0 for h in content_heights):
+            return frames
+
+        # Use median height as the target
+        valid_heights = sorted(h for h in content_heights if h > 0)
+        median_h = valid_heights[len(valid_heights) // 2]
+
+        tw, th = target_size
+        result: list[Image.Image] = []
+        for frame, bbox, ch in zip(frames, bboxes, content_heights):
+            if bbox is None or ch == 0:
+                result.append(frame)
+                continue
+
+            deviation = abs(ch - median_h) / median_h if median_h > 0 else 0
+            if deviation <= 0.15:
+                # Within tolerance — keep as-is
+                result.append(frame)
+                continue
+
+            # Re-crop and re-fit to match median proportions
+            cropped = frame.crop(bbox)
+            cw_content = bbox[2] - bbox[0]
+
+            # Scale to match median height while preserving aspect ratio
+            scale = median_h / ch
+            new_w = max(1, round(cw_content * scale))
+            new_h = max(1, round(ch * scale))
+            resized = cropped.resize((new_w, new_h), resample)
+
+            # Re-place on canvas with same anchor strategy
+            canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
+            x = (tw - new_w) // 2
+            if anchor == "bottom":
+                bottom_pad = max(1, round(th * 0.03)) if th >= 32 else 0
+                y = max(0, th - bottom_pad - new_h)
+            else:
+                y = (th - new_h) // 2
+            canvas.alpha_composite(resized, (x, y))
+            result.append(canvas)
+
+        return result
+
+    @staticmethod
     def clean_alpha_edges(img: Image.Image, threshold: int = 128) -> Image.Image:
         """Binarize the alpha channel (fully opaque or fully transparent, no
         in-between) and zero RGB on transparent pixels to prevent white edge halos."""
@@ -1879,7 +2022,7 @@ class GameAssetStudio:
                 prompt,
                 width=max(frame_size[0], 512),
                 height=max(frame_size[1], 512),
-                seed=base_seed + index,
+                seed=base_seed,
                 negative_prompt=PromptOptimizer.get_negative_prompt("character"),
             )
             provider_name = result.provider
@@ -1896,6 +2039,11 @@ class GameAssetStudio:
                 frame = self.proc.pixelate_clean(frame, block_size=effective_block, colors=colors)
             generated_frames.append(frame)
 
+        # --- Cross-frame consistency pipeline ---
+        generated_frames = self.proc.normalize_frame_sizes(
+            generated_frames, frame_size, anchor="bottom", resample=resample
+        )
+        generated_frames = self.proc.match_frames_colors(generated_frames)
         if form.style == "pixel_art":
             generated_frames = self.proc.unify_frames_palette(generated_frames, colors=colors)
 
@@ -1997,7 +2145,7 @@ class GameAssetStudio:
                 prompt,
                 width=max(frame_size[0], 512),
                 height=max(frame_size[1], 512),
-                seed=base_seed + index,
+                seed=base_seed,
                 negative_prompt=PromptOptimizer.get_negative_prompt("character"),
             )
             provider_name = result.provider
@@ -2014,6 +2162,11 @@ class GameAssetStudio:
                 frame = self.proc.pixelate_clean(frame, block_size=effective_block, colors=colors)
             generated_frames.append(frame)
 
+        # --- Cross-frame consistency pipeline ---
+        generated_frames = self.proc.normalize_frame_sizes(
+            generated_frames, frame_size, anchor="bottom", resample=resample
+        )
+        generated_frames = self.proc.match_frames_colors(generated_frames)
         if form.style == "pixel_art":
             generated_frames = self.proc.unify_frames_palette(generated_frames, colors=colors)
 
@@ -2223,7 +2376,9 @@ class GameAssetStudio:
         resample = Image.Resampling.BOX if style == "pixel_art" else Image.Resampling.LANCZOS
 
         for index in range(frames):
-            frame_seed = base_seed + index
+            # Use the SAME seed for all frames so Flux keeps the character design
+            # consistent.  The different pose descriptions in the prompt are enough
+            # to produce distinct keyframe silhouettes.
             prompt = PromptOptimizer.build_animation_frame_prompt(
                 character_identity, action, index, frames, style
             )
@@ -2231,7 +2386,7 @@ class GameAssetStudio:
                 prompt,
                 width=max(frame_size[0], 512),
                 height=max(frame_size[1], 512),
-                seed=frame_seed,
+                seed=base_seed,
                 negative_prompt=PromptOptimizer.get_negative_prompt("sprite_sheet"),
             )
             provider_name = result.provider
@@ -2248,6 +2403,14 @@ class GameAssetStudio:
                 frame = self.proc.pixelate_clean(frame, block_size=eff_block, colors=48)
             generated_frames.append(frame)
 
+        # --- Cross-frame consistency pipeline ---
+        # 1. Normalize proportions so character size doesn't jump between frames
+        generated_frames = self.proc.normalize_frame_sizes(
+            generated_frames, frame_size, anchor="bottom", resample=resample
+        )
+        # 2. Match color distribution of all frames to frame 0
+        generated_frames = self.proc.match_frames_colors(generated_frames)
+        # 3. Unify palette (pixel art only)
         if style == "pixel_art":
             generated_frames = self.proc.unify_frames_palette(generated_frames, colors=48)
 
@@ -2331,13 +2494,12 @@ class GameAssetStudio:
         model = ""
 
         for index, pose in enumerate(poses):
-            frame_seed = base_seed + index
             prompt = PromptOptimizer.build_key_pose_prompt(character_identity, pose, style)
             result = self.gen.generate_with_metadata(
                 prompt,
                 width=max(frame_size[0], 512),
                 height=max(frame_size[1], 512),
-                seed=frame_seed,
+                seed=base_seed,
                 negative_prompt=PromptOptimizer.get_negative_prompt("sprite_sheet"),
             )
             provider_name = result.provider
@@ -2354,6 +2516,11 @@ class GameAssetStudio:
                 frame = self.proc.pixelate_clean(frame, block_size=eff_block, colors=48)
             generated_frames.append(frame)
 
+        # --- Cross-frame consistency pipeline ---
+        generated_frames = self.proc.normalize_frame_sizes(
+            generated_frames, frame_size, anchor="bottom", resample=resample
+        )
+        generated_frames = self.proc.match_frames_colors(generated_frames)
         if style == "pixel_art":
             generated_frames = self.proc.unify_frames_palette(generated_frames, colors=48)
 
